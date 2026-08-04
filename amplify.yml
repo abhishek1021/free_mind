@@ -7,6 +7,9 @@ frontend:
     build:
       commands:
         - env | grep -e GEMINI_API_KEY >> .env.production
+        - env | grep -e TELEGRAM_API_ID >> .env.production
+        - env | grep -e TELEGRAM_API_HASH >> .env.production
+        - env | grep -e TELEGRAM_SESSION >> .env.production
         - npm run build
   artifacts:
     baseDirectory: .next

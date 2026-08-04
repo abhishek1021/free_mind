@@ -138,6 +138,28 @@ export async function fetchRandomGeminiCards(category?: string): Promise<MythCar
   return fetchGeminiCards(topic, cat);
 }
 
+// Fetch facts from multiple random topics within the same category, then shuffle them together
+export async function fetchCategoryMixedBatch(category: string): Promise<MythCard[]> {
+  const topics = CONTENT_CATEGORIES[category]?.topics ?? [];
+  if (topics.length === 0) return fetchRandomGeminiCards(category);
+
+  // Pick up to 4 unique random topics from the category
+  const shuffledTopics = [...topics].sort(() => Math.random() - 0.5);
+  const picked = shuffledTopics.slice(0, Math.min(4, topics.length));
+  const perTopic = Math.max(3, Math.ceil(12 / picked.length)); // ~12 total cards
+
+  const results = await Promise.allSettled(
+    picked.map((topic) => fetchGeminiCards(topic, category, perTopic))
+  );
+
+  const cards = results
+    .filter((r) => r.status === "fulfilled")
+    .flatMap((r) => (r as PromiseFulfilledResult<MythCard[]>).value);
+
+  // Shuffle so topics are interleaved rather than grouped
+  return cards.sort(() => Math.random() - 0.5);
+}
+
 // Fetch one fact each from `count` different random categories in parallel
 export async function fetchMixedBatch(count = 5): Promise<MythCard[]> {
   const cats = Object.keys(CONTENT_CATEGORIES);
@@ -168,6 +190,35 @@ const CATEGORY_SEARCH_HINTS: Record<string, string> = {
   "Mythology":      "Hindu mythology",
 };
 
+// ── Wikipedia rate-limit guard ────────────────────────────────
+// Cache: topic+category → image URL (persists for the browser session)
+const _imgCache = new Map<string, string>();
+
+// Serial queue: one Wikipedia request at a time, 200 ms apart
+type Resolver = () => void;
+const _queue: Array<() => Promise<void>> = [];
+let _queueRunning = false;
+
+async function _runQueue() {
+  if (_queueRunning) return;
+  _queueRunning = true;
+  while (_queue.length > 0) {
+    const task = _queue.shift()!;
+    await task();
+    await new Promise<void>((r: Resolver) => setTimeout(r, 200));
+  }
+  _queueRunning = false;
+}
+
+function _enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    _queue.push(async () => {
+      try { resolve(await fn()); } catch (e) { reject(e); }
+    });
+    _runQueue();
+  });
+}
+
 async function fetchSummaryImage(title: string): Promise<string> {
   const res = await fetch(
     `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`
@@ -177,31 +228,36 @@ async function fetchSummaryImage(title: string): Promise<string> {
   return data.originalimage?.source ?? data.thumbnail?.source ?? "";
 }
 
-// Client-side only — browser can reach Wikipedia directly
-export async function fetchDeityImageUrl(topic: string, category = ""): Promise<string> {
-  const slug = topic.replace(/\s*[&+]\s*/g, " ").trim().replace(/\s+/g, "_");
-  try {
-    // 1. Try direct page summary with the topic slug
-    const img1 = await fetchSummaryImage(slug);
-    if (img1) return img1;
+// Client-side only — browser can reach Wikipedia directly.
+// Requests are queued (one at a time, 200 ms apart) to stay within rate limits.
+export function fetchDeityImageUrl(topic: string, category = ""): Promise<string> {
+  const cacheKey = `${topic}::${category}`;
+  if (_imgCache.has(cacheKey)) return Promise.resolve(_imgCache.get(cacheKey)!);
 
-    // 2. Search Wikipedia with topic + category hint for a better match
-    const hint = CATEGORY_SEARCH_HINTS[category] ?? "";
-    const query = `${topic} ${hint}`.trim();
-    const searchRes = await fetch(
-      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`
-    );
-    if (!searchRes.ok) return "";
-    const searchData = await searchRes.json();
-    const results: { title: string }[] = searchData?.query?.search ?? [];
+  return _enqueue(async () => {
+    // Return from cache if a parallel call already resolved it while we waited
+    if (_imgCache.has(cacheKey)) return _imgCache.get(cacheKey)!;
 
-    // Try each search result until we find one with an image
-    for (const result of results) {
-      const img = await fetchSummaryImage(result.title);
-      if (img) return img;
-    }
+    const slug = topic.replace(/\s*[&+]\s*/g, " ").trim().replace(/\s+/g, "_");
+    try {
+      const img1 = await fetchSummaryImage(slug);
+      if (img1) { _imgCache.set(cacheKey, img1); return img1; }
+
+      const hint  = CATEGORY_SEARCH_HINTS[category] ?? "";
+      const query = `${topic} ${hint}`.trim();
+      const searchRes = await fetch(
+        `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`
+      );
+      if (!searchRes.ok) { _imgCache.set(cacheKey, ""); return ""; }
+      const searchData = await searchRes.json();
+      const results: { title: string }[] = searchData?.query?.search ?? [];
+
+      for (const result of results) {
+        const img = await fetchSummaryImage(result.title);
+        if (img) { _imgCache.set(cacheKey, img); return img; }
+      }
+    } catch { /* network error — return empty */ }
+    _imgCache.set(cacheKey, "");
     return "";
-  } catch {
-    return "";
-  }
+  });
 }
