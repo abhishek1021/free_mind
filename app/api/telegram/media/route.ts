@@ -57,20 +57,7 @@ export async function GET(req: NextRequest) {
       return new Response("Cannot locate file", { status: 500 });
     }
 
-    // ── Photos: buffer entirely and return — small files, no stream needed ──────
-    if (msg.photo) {
-      const buf = await client.downloadMedia(msg.media, {}) as Buffer | undefined;
-      if (!buf?.length) return new Response("Failed to download photo", { status: 502 });
-      return new Response(buf, {
-        headers: {
-          "Content-Type": "image/jpeg",
-          "Cache-Control": "public, max-age=3600",
-          "Content-Length": String(buf.length),
-        },
-      });
-    }
-
-    // ── Documents / videos: stream with cancellation guard ───────────────────
+    // ── Stream file to browser (photos + documents/videos) ───────────────────
     const loc = fileLocation;
     let cancelled = false;
     const readable = new ReadableStream({
@@ -81,19 +68,22 @@ export async function GET(req: NextRequest) {
             file: loc,
             requestSize: 512 * 1024,
           })) {
-            if (cancelled) break; // client disconnected — stop downloading
+            if (cancelled) break; // client disconnected — stop, don't enqueue
             controller.enqueue(new Uint8Array(chunk as Buffer));
           }
           if (!cancelled) controller.close();
         } catch (err) {
-          if (!cancelled) {
+          // Silently swallow "Controller is already closed" — it just means the
+          // browser cancelled the request (navigation, component unmount, etc.)
+          const msg = String(err);
+          if (!cancelled && !msg.includes("already closed") && !msg.includes("ERR_INVALID_STATE")) {
             console.error("[media stream]", err);
-            try { controller.error(err); } catch { /* controller already closed */ }
           }
+          try { controller.error(err); } catch { /* already closed, ignore */ }
         }
       },
       cancel() {
-        cancelled = true; // signals the loop above to stop
+        cancelled = true;
       },
     });
 
