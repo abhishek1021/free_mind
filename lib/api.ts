@@ -176,88 +176,27 @@ export async function fetchMixedBatch(count = 5): Promise<MythCard[]> {
     .flatMap((r) => (r as PromiseFulfilledResult<MythCard[]>).value);
 }
 
-// Category-specific search hints so Wikipedia finds visually rich articles
-const CATEGORY_SEARCH_HINTS: Record<string, string> = {
-  "Life Hacks":     "self improvement productivity",
-  "Philosophy":     "ancient philosophy",
-  "Psychology":     "cognitive psychology",
-  "Science":        "scientific discovery",
-  "History":        "historical event",
-  "World Facts":    "geography nature",
-  "Riddles":        "puzzle logic",
-  "Short Stories":  "literature tale",
-  "Moral Stories":  "fable folklore",
-  "Mythology":      "Hindu mythology",
-};
-
-// ── Wikipedia rate-limit guard ────────────────────────────────
-// Cache: topic+category → image URL (persists for the browser session)
+// ── Client-side image cache (browser session) ─────────────────
+// Prevents re-fetching the same topic within the same page session.
 const _imgCache = new Map<string, string>();
 
-// Serial queue: one Wikipedia request at a time, 200 ms apart
-type Resolver = () => void;
-const _queue: Array<() => Promise<void>> = [];
-let _queueRunning = false;
-
-async function _runQueue() {
-  if (_queueRunning) return;
-  _queueRunning = true;
-  while (_queue.length > 0) {
-    const task = _queue.shift()!;
-    await task();
-    await new Promise<void>((r: Resolver) => setTimeout(r, 200));
-  }
-  _queueRunning = false;
-}
-
-function _enqueue<T>(fn: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    _queue.push(async () => {
-      try { resolve(await fn()); } catch (e) { reject(e); }
-    });
-    _runQueue();
-  });
-}
-
-async function fetchSummaryImage(title: string): Promise<string> {
-  const res = await fetch(
-    `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`
-  );
-  if (!res.ok) return "";
-  const data = await res.json();
-  return data.originalimage?.source ?? data.thumbnail?.source ?? "";
-}
-
-// Client-side only — browser can reach Wikipedia directly.
-// Requests are queued (one at a time, 200 ms apart) to stay within rate limits.
-export function fetchDeityImageUrl(topic: string, category = ""): Promise<string> {
+// Fetch image URL via the server-side /api/image route.
+// The server maintains its own persistent cache and handles all Wikipedia
+// rate-limiting — the client never talks to Wikipedia directly.
+export async function fetchDeityImageUrl(topic: string, category = ""): Promise<string> {
   const cacheKey = `${topic}::${category}`;
-  if (_imgCache.has(cacheKey)) return Promise.resolve(_imgCache.get(cacheKey)!);
+  if (_imgCache.has(cacheKey)) return _imgCache.get(cacheKey)!;
 
-  return _enqueue(async () => {
-    // Return from cache if a parallel call already resolved it while we waited
-    if (_imgCache.has(cacheKey)) return _imgCache.get(cacheKey)!;
-
-    const slug = topic.replace(/\s*[&+]\s*/g, " ").trim().replace(/\s+/g, "_");
-    try {
-      const img1 = await fetchSummaryImage(slug);
-      if (img1) { _imgCache.set(cacheKey, img1); return img1; }
-
-      const hint  = CATEGORY_SEARCH_HINTS[category] ?? "";
-      const query = `${topic} ${hint}`.trim();
-      const searchRes = await fetch(
-        `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`
-      );
-      if (!searchRes.ok) { _imgCache.set(cacheKey, ""); return ""; }
-      const searchData = await searchRes.json();
-      const results: { title: string }[] = searchData?.query?.search ?? [];
-
-      for (const result of results) {
-        const img = await fetchSummaryImage(result.title);
-        if (img) { _imgCache.set(cacheKey, img); return img; }
-      }
-    } catch { /* network error — return empty */ }
+  try {
+    const res  = await fetch(
+      `/api/image?topic=${encodeURIComponent(topic)}&category=${encodeURIComponent(category)}`
+    );
+    const data = await res.json();
+    const url  = data.url ?? "";
+    _imgCache.set(cacheKey, url);
+    return url;
+  } catch {
     _imgCache.set(cacheKey, "");
     return "";
-  });
+  }
 }

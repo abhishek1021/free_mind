@@ -4,12 +4,16 @@ frontend:
     preBuild:
       commands:
         - npm ci
+        # Stamp the service worker with a unique build version so every deployment
+        # busts the old cache automatically — users always get the latest UI
+        - BUILD_VERSION=$(date +%s) && sed -i "s/BUILD_VERSION/${BUILD_VERSION}/g" public/sw.js
     build:
       commands:
         - env | grep -e GEMINI_API_KEY >> .env.production
         - env | grep -e TELEGRAM_API_ID >> .env.production
         - env | grep -e TELEGRAM_API_HASH >> .env.production
         - env | grep -e TELEGRAM_SESSION >> .env.production
+        - env | grep -e PEXELS_API_KEY >> .env.production
         - npm run build
   artifacts:
     baseDirectory: .next

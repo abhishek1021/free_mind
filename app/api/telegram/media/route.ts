@@ -57,23 +57,43 @@ export async function GET(req: NextRequest) {
       return new Response("Cannot locate file", { status: 500 });
     }
 
-    // Stream chunks to the browser as they arrive — video starts playing immediately
+    // ── Photos: buffer entirely and return — small files, no stream needed ──────
+    if (msg.photo) {
+      const buf = await client.downloadMedia(msg.media, {}) as Buffer | undefined;
+      if (!buf?.length) return new Response("Failed to download photo", { status: 502 });
+      return new Response(buf, {
+        headers: {
+          "Content-Type": "image/jpeg",
+          "Cache-Control": "public, max-age=3600",
+          "Content-Length": String(buf.length),
+        },
+      });
+    }
+
+    // ── Documents / videos: stream with cancellation guard ───────────────────
     const loc = fileLocation;
+    let cancelled = false;
     const readable = new ReadableStream({
       async start(controller) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           for await (const chunk of (client as any).iterDownload({
             file: loc,
-            requestSize: 512 * 1024, // 512 KB per request
+            requestSize: 512 * 1024,
           })) {
+            if (cancelled) break; // client disconnected — stop downloading
             controller.enqueue(new Uint8Array(chunk as Buffer));
           }
-          controller.close();
+          if (!cancelled) controller.close();
         } catch (err) {
-          console.error("[media stream]", err);
-          controller.error(err);
+          if (!cancelled) {
+            console.error("[media stream]", err);
+            try { controller.error(err); } catch { /* controller already closed */ }
+          }
         }
+      },
+      cancel() {
+        cancelled = true; // signals the loop above to stop
       },
     });
 

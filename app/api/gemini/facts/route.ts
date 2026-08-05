@@ -56,22 +56,41 @@ export async function GET(req: NextRequest) {
   try {
     const result = await model.generateContent(prompt);
     const raw = result.response.text().trim();
-    const cleaned = raw
+
+    // Strip markdown code fences if present
+    let cleaned = raw
       .replace(/^```json\s*/i, "")
       .replace(/^```\s*/i, "")
       .replace(/\s*```$/i, "")
       .trim();
 
-    const parsed = JSON.parse(cleaned) as { topic: string; category: string; facts: string[] };
+    // Extract the first complete JSON object — handles extra text before/after
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) cleaned = jsonMatch[0];
+
+    // Remove trailing commas before } or ] which Gemini occasionally emits
+    cleaned = cleaned.replace(/,\s*([}\]])/g, "$1");
+
+    let parsed: { topic?: string; category?: string; facts?: string[] };
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      // Last resort: try to salvage just the facts array
+      const factsMatch = cleaned.match(/"facts"\s*:\s*(\[[\s\S]*?\])/);
+      if (!factsMatch) throw new Error(`Unparseable response: ${cleaned.slice(0, 200)}`);
+      parsed = { facts: JSON.parse(factsMatch[1]) };
+    }
+
+    const facts = Array.isArray(parsed.facts) ? parsed.facts.filter(Boolean) : [];
 
     return NextResponse.json({
       deity: parsed.topic ?? topic,
-      facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+      facts,
       imageUrl: "",
       wikipediaUrl: `https://en.wikipedia.org/wiki/${encodeURIComponent(topic)}`,
       category: parsed.category ?? category,
       source: "Gemini AI",
-      total_facts_available: parsed.facts?.length ?? 0,
+      total_facts_available: facts.length,
     });
   } catch (err) {
     console.error("[gemini/facts]", err);

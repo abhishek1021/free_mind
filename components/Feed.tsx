@@ -61,6 +61,17 @@ export default function Feed() {
   const [channelPosts, setChannelPosts]     = useState<TelegramPost[]>([]);
   const [channelLoading, setChannelLoading] = useState(false);
   const [channelError, setChannelError]     = useState<string | null>(null);
+  const [channelsOpen, setChannelsOpen]     = useState(true); // accordion open by default until first pick
+
+  // Fire prefetch every time the user lands on the channels tab
+  useEffect(() => {
+    if (tab !== "channels") return;
+    fetch("/api/telegram/posts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channels: TELEGRAM_CHANNELS.map((c) => c.username) }),
+    }).catch(() => {});
+  }, [tab]);
 
   // ── Story reader ──────────────────────────────────────────────
   const [storyCard, setStoryCard] = useState<MythCard | null>(null);
@@ -74,6 +85,7 @@ export default function Feed() {
       if (saved) setBookmarks(JSON.parse(saved));
     } catch {}
     loadInitialFeed(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Feed helpers ──────────────────────────────────────────────
@@ -99,7 +111,7 @@ export default function Feed() {
     const results = await Promise.allSettled(
       picks.map(async (ch): Promise<FeedItem | null> => {
         try {
-          const res  = await fetch(`/api/telegram/posts?channel=${ch.username}&limit=10`);
+          const res  = await fetch(`/api/telegram/posts?channel=${ch.username}&limit=30`);
           const data = await res.json();
           const posts: TelegramPost[] = data.posts ?? [];
           const fresh = posts.filter((p) => !seenPostIds.current.has(`${ch.username}-${p.id}`));
@@ -137,15 +149,22 @@ export default function Feed() {
     seenPostIds.current.clear();
     channelPool.current = [];
 
+    // Start both fetches immediately in parallel
+    const factsPromise = category ? fetchCategoryMixedBatch(category) : fetchMixedBatch(6);
+    const tgPromise    = category ? Promise.resolve([] as FeedItem[]) : fetchTelegramItems(4);
+
     try {
-      const [facts, tgItems] = await Promise.all([
-        category ? fetchCategoryMixedBatch(category) : fetchMixedBatch(6),
-        category ? Promise.resolve([]) : fetchTelegramItems(4),
-      ]);
-      setFeedItems(interleave(facts, tgItems));
+      // Phase 1 — show facts the moment they arrive, dismiss loading spinner
+      const facts = await factsPromise;
+      setFeedItems(facts.map((card) => ({ kind: "fact" as const, card, uid: card.id })));
+      setFeedLoading(false);
+
+      // Phase 2 — Telegram posts arrive later; silently splice into feed
+      tgPromise.then((tgItems) => {
+        if (tgItems.length > 0) setFeedItems(interleave(facts, tgItems));
+      }).catch(() => {});
     } catch {
       setFeedError(true);
-    } finally {
       setFeedLoading(false);
     }
   }
@@ -154,12 +173,21 @@ export default function Feed() {
     if (feedLoadingMoreRef.current) return;
     feedLoadingMoreRef.current = true;
     setFeedLoadingMore(true);
+
+    // Start both in parallel; dismiss spinner as soon as facts land
+    const factsPromise = activeCategory ? fetchCategoryMixedBatch(activeCategory) : fetchMixedBatch(6);
+    const tgPromise    = activeCategory ? Promise.resolve([] as FeedItem[]) : fetchTelegramItems(4);
+
     try {
-      const [facts, tgItems] = await Promise.all([
-        activeCategory ? fetchCategoryMixedBatch(activeCategory) : fetchMixedBatch(6),
-        activeCategory ? Promise.resolve([]) : fetchTelegramItems(4),
-      ]);
-      setFeedItems((prev) => [...prev, ...interleave(facts, tgItems)]);
+      const facts = await factsPromise;
+      setFeedItems((prev) => [...prev, ...facts.map((card) => ({ kind: "fact" as const, card, uid: card.id }))]);
+      setFeedLoadingMore(false);
+      feedLoadingMoreRef.current = false;
+
+      // Telegram posts trickle in later — append without triggering the loading spinner
+      tgPromise.then((tgItems) => {
+        if (tgItems.length > 0) setFeedItems((prev) => [...prev, ...tgItems]);
+      }).catch(() => {});
     } catch {}
     finally {
       setFeedLoadingMore(false);
@@ -268,14 +296,31 @@ export default function Feed() {
     setChannelLoading(true);
     setChannelError(null);
     setChannelPosts([]);
+
     try {
-      const res  = await fetch(`/api/telegram/posts?channel=${ch.username}&limit=20`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Failed");
-      setChannelPosts(data.posts ?? []);
+      // Phase 1 — fetch first 10 posts (cache hit = ~10ms, miss = still fast with smaller pool)
+      const res1  = await fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=10&initial=1`);
+      const data1 = await res1.json();
+      if (!res1.ok) throw new Error(data1.error ?? "Failed");
+
+      const initial: TelegramPost[] = data1.posts ?? [];
+      setChannelPosts(initial);
+      setChannelLoading(false);
+
+      // Phase 2 — silently fetch the remaining posts and append
+      if (initial.length >= 10) {
+        fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=20`)
+          .then((r) => r.json())
+          .then((data2) => {
+            const more: TelegramPost[] = (data2.posts ?? []).filter(
+              (p: TelegramPost) => !initial.some((i) => i.id === p.id)
+            );
+            if (more.length > 0) setChannelPosts((prev) => [...prev, ...more]);
+          })
+          .catch(() => {});
+      }
     } catch (err) {
       setChannelError(String(err));
-    } finally {
       setChannelLoading(false);
     }
   }
@@ -543,32 +588,54 @@ export default function Feed() {
         {/* ── CHANNELS TAB ──────────────────────────────────────── */}
         {tab === "channels" && (
           <div className="h-full flex flex-col">
+            {/* Accordion header */}
             <div className="px-4 pt-4 flex-shrink-0">
-              <h2 className="text-white font-semibold text-base mb-1">Channels</h2>
-              <p className="text-xs mb-3" style={{ color: "rgba(255,255,255,0.3)" }}>Live posts from Telegram</p>
-              <div className="flex flex-wrap gap-2 pb-3">
-                {TELEGRAM_CHANNELS.map((ch) => (
-                  <button
-                    key={ch.username}
-                    onClick={() => loadChannel(ch)}
-                    className="px-3.5 py-2 rounded-full text-xs font-medium transition-all"
-                    style={
-                      activeChannel?.username === ch.username
-                        ? { background: "#2481cc", color: "#fff" }
-                        : { background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.5)" }
-                    }
-                  >
-                    {ch.emoji} {ch.name}
-                  </button>
-                ))}
-              </div>
+              <button
+                onClick={() => setChannelsOpen((v) => !v)}
+                className="w-full flex items-center justify-between mb-1"
+                style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}
+              >
+                <h2 className="text-white font-semibold text-base">
+                  {activeChannel ? `${activeChannel.emoji} ${activeChannel.name}` : "Channels"}
+                </h2>
+                <span className="text-xs px-2 py-0.5 rounded-full flex items-center gap-1"
+                  style={{ background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.5)" }}>
+                  {channelsOpen ? "▲ hide" : "▼ select"}
+                </span>
+              </button>
+              {!channelsOpen && activeChannel && (
+                <p className="text-xs mb-1" style={{ color: "rgba(255,255,255,0.3)" }}>Tap header to switch channel</p>
+              )}
+              {!channelsOpen && !activeChannel && (
+                <p className="text-xs mb-1" style={{ color: "rgba(255,255,255,0.3)" }}>Tap header to pick a channel</p>
+              )}
+
+              {/* Collapsible chip grid */}
+              {channelsOpen && (
+                <div className="accordion-chips flex flex-wrap gap-2 pt-2 pb-3">
+                  {TELEGRAM_CHANNELS.map((ch) => (
+                    <button
+                      key={ch.username}
+                      onClick={() => { loadChannel(ch); setChannelsOpen(false); }}
+                      className="px-3.5 py-2 rounded-full text-xs font-medium transition-all"
+                      style={
+                        activeChannel?.username === ch.username
+                          ? { background: "#2481cc", color: "#fff" }
+                          : { background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.5)" }
+                      }
+                    >
+                      {ch.emoji} {ch.name}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="flex-1 overflow-y-auto px-4 pb-6">
               {!activeChannel ? (
                 <div className="flex flex-col items-center justify-center h-64 text-center gap-3 px-6">
                   <span className="text-4xl">📡</span>
-                  <p className="text-sm font-medium text-white">Pick a channel above</p>
-                  <p className="text-xs leading-relaxed" style={{ color: "rgba(255,255,255,0.3)" }}>Live posts from public Telegram channels</p>
+                  <p className="text-sm font-medium text-white">Pick a channel to start</p>
+                  <p className="text-xs leading-relaxed" style={{ color: "rgba(255,255,255,0.3)" }}>Tap "select" at the top to choose a channel</p>
                 </div>
               ) : channelLoading ? (
                 <div className="flex flex-col gap-3 mt-1">
