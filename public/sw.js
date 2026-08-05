@@ -12,6 +12,15 @@ self.addEventListener('activate', (e) => {
     caches.keys()
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
+      .then(() => {
+        // After the new SW takes control, reload all open windows so they pick up
+        // the new HTML (which references new content-hashed JS/CSS chunks).
+        // Without this, old open tabs keep running stale bundles.
+        return self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      })
+      .then((clients) => {
+        clients.forEach((client) => client.navigate(client.url));
+      })
   );
 });
 
