@@ -289,16 +289,54 @@ export default function Feed() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exploreCards.length, exploreCategory]);
 
+  // ── Channel client-side cache (sessionStorage) ───────────────
+  // Survives Lambda cold starts and container switches on Amplify serverless.
+  // sessionStorage clears automatically when the PWA session ends.
+  const CH_TTL = 5 * 60 * 1000;
+  function getChCache(username: string): TelegramPost[] | null {
+    try {
+      const raw = sessionStorage.getItem(`fm_ch_${username}`);
+      if (!raw) return null;
+      const { posts, ts } = JSON.parse(raw);
+      return Date.now() - ts < CH_TTL ? posts : null;
+    } catch { return null; }
+  }
+  function setChCache(username: string, posts: TelegramPost[]) {
+    try {
+      sessionStorage.setItem(`fm_ch_${username}`, JSON.stringify({ posts, ts: Date.now() }));
+    } catch {}
+  }
+
   // ── Channel actions ───────────────────────────────────────────
 
   async function loadChannel(ch: TelegramChannel) {
     setActiveChannel(ch);
-    setChannelLoading(true);
     setChannelError(null);
+
+    // Phase 1 — instant display from client cache if available
+    const cached = getChCache(ch.username);
+    if (cached && cached.length > 0) {
+      setChannelPosts(cached.slice(0, 10));
+      setChannelLoading(false);
+      // Refresh in background so next open is fresh
+      fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=20`)
+        .then((r) => r.json())
+        .then((data) => {
+          const posts: TelegramPost[] = data.posts ?? [];
+          if (posts.length > 0) {
+            setChCache(ch.username, posts);
+            setChannelPosts(posts);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+
+    // Phase 1 — no cache, show skeleton and fetch first 10
+    setChannelLoading(true);
     setChannelPosts([]);
 
     try {
-      // Phase 1 — fetch first 10 posts (cache hit = ~10ms, miss = still fast with smaller pool)
       const res1  = await fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=10&initial=1`);
       const data1 = await res1.json();
       if (!res1.ok) throw new Error(data1.error ?? "Failed");
@@ -307,18 +345,17 @@ export default function Feed() {
       setChannelPosts(initial);
       setChannelLoading(false);
 
-      // Phase 2 — silently fetch the remaining posts and append
-      if (initial.length >= 10) {
-        fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=20`)
-          .then((r) => r.json())
-          .then((data2) => {
-            const more: TelegramPost[] = (data2.posts ?? []).filter(
-              (p: TelegramPost) => !initial.some((i) => i.id === p.id)
-            );
-            if (more.length > 0) setChannelPosts((prev) => [...prev, ...more]);
-          })
-          .catch(() => {});
-      }
+      // Phase 2 — fetch remaining posts silently and update cache
+      fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=20`)
+        .then((r) => r.json())
+        .then((data2) => {
+          const posts: TelegramPost[] = data2.posts ?? [];
+          if (posts.length > 0) {
+            setChCache(ch.username, posts);
+            setChannelPosts(posts);
+          }
+        })
+        .catch(() => {});
     } catch (err) {
       setChannelError(String(err));
       setChannelLoading(false);

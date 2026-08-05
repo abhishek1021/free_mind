@@ -3,7 +3,7 @@ import { getTelegramClient } from "@/lib/telegram-client";
 import { Api } from "telegram";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
@@ -23,15 +23,15 @@ export async function GET(req: NextRequest) {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const doc  = msg.document as any;
-    const mimeType: string = msg.photo ? "image/jpeg" : (doc?.mimeType ?? "application/octet-stream");
+    const doc      = msg.document as any;
+    const mimeType = msg.photo ? "image/jpeg" : (doc?.mimeType ?? "application/octet-stream");
     const fileSize: number = doc?.size ?? 0;
 
     if (fileSize > 80 * 1024 * 1024) {
-      return new Response("Video too large to stream (>80 MB)", { status: 413 });
+      return new Response("File too large (>80 MB)", { status: 413 });
     }
 
-    // Build the low-level file location for streaming
+    // Build file location
     let fileLocation: Api.TypeInputFileLocation | null = null;
 
     if (msg.photo) {
@@ -57,44 +57,50 @@ export async function GET(req: NextRequest) {
       return new Response("Cannot locate file", { status: 500 });
     }
 
-    // ── Stream file to browser (photos + documents/videos) ───────────────────
+    // ── Buffer the entire file ────────────────────────────────────────────────
+    // Required for:
+    //   • Range request support (iOS Safari mandates this for <video> playback)
+    //   • Stable Content-Length header (chunked encoding breaks mobile video)
+    // Photos are small (<1 MB). Videos are typically 5–30 MB on Telegram channels.
     const loc = fileLocation;
-    let cancelled = false;
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          for await (const chunk of (client as any).iterDownload({
-            file: loc,
-            requestSize: 512 * 1024,
-          })) {
-            if (cancelled) break; // client disconnected — stop, don't enqueue
-            controller.enqueue(new Uint8Array(chunk as Buffer));
-          }
-          if (!cancelled) controller.close();
-        } catch (err) {
-          // Silently swallow "Controller is already closed" — it just means the
-          // browser cancelled the request (navigation, component unmount, etc.)
-          const msg = String(err);
-          if (!cancelled && !msg.includes("already closed") && !msg.includes("ERR_INVALID_STATE")) {
-            console.error("[media stream]", err);
-          }
-          try { controller.error(err); } catch { /* already closed, ignore */ }
-        }
-      },
-      cancel() {
-        cancelled = true;
+    const chunks: Uint8Array[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for await (const chunk of (client as any).iterDownload({ file: loc, requestSize: 512 * 1024 })) {
+      chunks.push(new Uint8Array(chunk as Buffer));
+    }
+    const totalBytes = chunks.reduce((n, c) => n + c.length, 0);
+    const body = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const c of chunks) { body.set(c, off); off += c.length; }
+
+    // ── Range request handling (required for iOS Safari / PWA video) ──────────
+    const rangeHeader = req.headers.get("range");
+    if (rangeHeader?.startsWith("bytes=")) {
+      const [s, e] = rangeHeader.replace("bytes=", "").split("-");
+      const start  = parseInt(s)  || 0;
+      const end    = e ? parseInt(e) : totalBytes - 1;
+      const slice  = body.slice(start, end + 1);
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          "Content-Type":   mimeType,
+          "Content-Range":  `bytes ${start}-${end}/${totalBytes}`,
+          "Accept-Ranges":  "bytes",
+          "Content-Length": String(slice.length),
+          "Cache-Control":  "public, max-age=3600",
+        },
+      });
+    }
+
+    // ── Full response ─────────────────────────────────────────────────────────
+    return new Response(body, {
+      headers: {
+        "Content-Type":   mimeType,
+        "Accept-Ranges":  "bytes",
+        "Content-Length": String(totalBytes),
+        "Cache-Control":  "public, max-age=3600",
       },
     });
-
-    const headers: Record<string, string> = {
-      "Content-Type": mimeType,
-      "Cache-Control": "public, max-age=3600",
-      "Transfer-Encoding": "chunked",
-    };
-    if (fileSize > 0) headers["Content-Length"] = String(fileSize);
-
-    return new Response(readable, { headers });
   } catch (err) {
     console.error("[telegram/media]", err);
     return new Response("Error fetching media", { status: 500 });
