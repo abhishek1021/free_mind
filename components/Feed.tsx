@@ -99,47 +99,35 @@ export default function Feed() {
     return a;
   }
 
-  // Pick `batchSize` random channels from a shuffled pool; refill when depleted
-  async function fetchTelegramItems(batchSize = 4): Promise<FeedItem[]> {
-    if (TELEGRAM_CHANNELS.length === 0) return [];
+  // Fetch posts from `count` channels one-at-a-time (sequential, not parallel).
+  // Calls `onItem` immediately after each channel resolves so posts appear in
+  // the feed one-by-one rather than all at once. Limit=5 keeps thumbnail
+  // downloads small, reducing auth.ExportAuthorization calls to Telegram.
+  async function fetchTelegramSequential(
+    count: number,
+    onItem: (item: FeedItem) => void
+  ): Promise<void> {
+    if (TELEGRAM_CHANNELS.length === 0) return;
 
-    if (channelPool.current.length < batchSize) {
+    if (channelPool.current.length < count) {
       channelPool.current = [...channelPool.current, ...shuffled(TELEGRAM_CHANNELS)];
     }
-    const picks = channelPool.current.splice(0, batchSize);
+    const picks = channelPool.current.splice(0, count);
 
-    const results = await Promise.allSettled(
-      picks.map(async (ch): Promise<FeedItem | null> => {
-        try {
-          const res  = await fetch(`/api/telegram/posts?channel=${ch.username}&limit=30`);
-          const data = await res.json();
-          const posts: TelegramPost[] = data.posts ?? [];
-          const fresh = posts.filter((p) => !seenPostIds.current.has(`${ch.username}-${p.id}`));
-          if (fresh.length === 0) return null;
-          const post = fresh[0];
-          seenPostIds.current.add(`${ch.username}-${post.id}`);
-          return { kind: "post", post, channel: ch, uid: `${ch.username}-${post.id}` };
-        } catch {
-          return null;
-        }
-      })
-    );
-
-    return results
-      .filter((r): r is PromiseFulfilledResult<FeedItem> => r.status === "fulfilled" && r.value !== null)
-      .map((r) => r.value);
-  }
-
-  function interleave(facts: MythCard[], posts: FeedItem[]): FeedItem[] {
-    const out: FeedItem[] = [];
-    let pi = 0;
-    facts.forEach((card, i) => {
-      out.push({ kind: "fact", card, uid: card.id });
-      if ((i + 1) % 3 === 0 && pi < posts.length) out.push(posts[pi++]);
-    });
-    // append any leftover posts
-    while (pi < posts.length) out.push(posts[pi++]);
-    return out;
+    for (const ch of picks) {
+      try {
+        const res  = await fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=5`);
+        const data = await res.json();
+        const posts: TelegramPost[] = data.posts ?? [];
+        const fresh = posts.filter((p) => !seenPostIds.current.has(`${ch.username}-${p.id}`));
+        if (fresh.length === 0) continue;
+        const post = fresh[0];
+        seenPostIds.current.add(`${ch.username}-${post.id}`);
+        onItem({ kind: "post", post, channel: ch, uid: `${ch.username}-${post.id}` });
+      } catch {
+        // skip this channel, continue to the next
+      }
+    }
   }
 
   async function loadInitialFeed(category: string | null) {
@@ -149,20 +137,21 @@ export default function Feed() {
     seenPostIds.current.clear();
     channelPool.current = [];
 
-    // Start both fetches immediately in parallel
     const factsPromise = category ? fetchCategoryMixedBatch(category) : fetchMixedBatch(6);
-    const tgPromise    = category ? Promise.resolve([] as FeedItem[]) : fetchTelegramItems(4);
 
     try {
-      // Phase 1 — show facts the moment they arrive, dismiss loading spinner
+      // Phase 1 — show facts immediately, dismiss loading spinner
       const facts = await factsPromise;
       setFeedItems(facts.map((card) => ({ kind: "fact" as const, card, uid: card.id })));
       setFeedLoading(false);
 
-      // Phase 2 — Telegram posts arrive later; silently splice into feed
-      tgPromise.then((tgItems) => {
-        if (tgItems.length > 0) setFeedItems(interleave(facts, tgItems));
-      }).catch(() => {});
+      // Phase 2 — fetch Telegram posts one channel at a time; each post appends
+      // to the feed as soon as it arrives (no waiting for all channels to finish)
+      if (!category) {
+        fetchTelegramSequential(4, (item) => {
+          setFeedItems((prev) => [...prev, item]);
+        }).catch(() => {});
+      }
     } catch {
       setFeedError(true);
       setFeedLoading(false);
@@ -174,22 +163,24 @@ export default function Feed() {
     feedLoadingMoreRef.current = true;
     setFeedLoadingMore(true);
 
-    // Start both in parallel; dismiss spinner as soon as facts land
     const factsPromise = activeCategory ? fetchCategoryMixedBatch(activeCategory) : fetchMixedBatch(6);
-    const tgPromise    = activeCategory ? Promise.resolve([] as FeedItem[]) : fetchTelegramItems(4);
 
     try {
+      // Phase 1 — append facts and dismiss the loading spinner
       const facts = await factsPromise;
       setFeedItems((prev) => [...prev, ...facts.map((card) => ({ kind: "fact" as const, card, uid: card.id }))]);
       setFeedLoadingMore(false);
       feedLoadingMoreRef.current = false;
 
-      // Telegram posts trickle in later — append without triggering the loading spinner
-      tgPromise.then((tgItems) => {
-        if (tgItems.length > 0) setFeedItems((prev) => [...prev, ...tgItems]);
-      }).catch(() => {});
-    } catch {}
-    finally {
+      // Phase 2 — append Telegram posts one at a time after facts are shown
+      if (!activeCategory) {
+        fetchTelegramSequential(4, (item) => {
+          setFeedItems((prev) => [...prev, item]);
+        }).catch(() => {});
+      }
+    } catch {
+      // ignore
+    } finally {
       setFeedLoadingMore(false);
       feedLoadingMoreRef.current = false;
     }
@@ -957,6 +948,10 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
   const [imgLoaded, setImgLoaded] = useState(false);
   const [imgError, setImgError]   = useState(false);
   const [modal, setModal]         = useState(false);
+  // videoSrc is only set when user explicitly taps the play button.
+  // Auto-loading on scroll triggers auth.ExportAuthorization for each cross-DC
+  // file, quickly hitting Telegram's FLOOD_WAIT rate limit (error 420).
+  const [videoSrc, setVideoSrc]   = useState<string | null>(null);
   const videoRef     = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -966,21 +961,27 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
     day: "numeric", month: "short", year: "numeric",
   });
 
+  // Pause video when it leaves the viewport (no auto-play — only pause)
   useEffect(() => {
-    if (!post.hasVideo || !post.mediaUrl || !containerRef.current) return;
+    if (!post.hasVideo || !containerRef.current) return;
     const obs = new IntersectionObserver(
-      ([entry]) => {
-        const v = videoRef.current;
-        if (!v) return;
-        entry.isIntersecting && entry.intersectionRatio >= 0.5
-          ? v.play().catch(() => {})
-          : v.pause();
-      },
-      { threshold: 0.5 }
+      ([entry]) => { if (!entry.isIntersecting) videoRef.current?.pause(); },
+      { threshold: 0.1 }
     );
     obs.observe(containerRef.current);
     return () => obs.disconnect();
-  }, [post.hasVideo, post.mediaUrl]);
+  }, [post.hasVideo]);
+
+  function handlePlay() {
+    if (!post.mediaUrl) return;
+    if (!videoSrc) {
+      setVideoSrc(post.mediaUrl);
+      // Allow one microtask for React to set src before calling play()
+      setTimeout(() => videoRef.current?.play().catch(() => {}), 0);
+    } else {
+      videoRef.current?.play().catch(() => {});
+    }
+  }
 
   return (
     <>
@@ -1002,32 +1003,61 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
       >
         {post.hasVideo && post.mediaUrl && (
           <div ref={containerRef} className="relative w-full" style={{ background: "#000" }}>
-            <video
-              ref={videoRef}
-              src={post.mediaUrl}
-              muted={muted}
-              playsInline
-              loop
-              preload="metadata"
-              className="w-full"
-              style={{ maxHeight: "340px", display: "block" }}
-            />
-            <button
-              onClick={() => setMuted((m) => !m)}
-              onPointerDown={(e) => e.stopPropagation()}
-              className="absolute bottom-2 right-2 flex items-center justify-center rounded-full"
-              style={{ width: 32, height: 32, background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
-            >
-              {muted ? (
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
-                  <path d="M16.5 12A4.5 4.5 0 0014 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25A6.956 6.956 0 0112 19c-.34 0-.68-.03-1-.08v2.06c.33.05.66.08 1 .02 1.85 0 3.57-.57 4.98-1.53l1.79 1.79L20 19.73 4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
-                  <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                </svg>
-              )}
-            </button>
+            {/* Poster image always shown; tap play button to load the video */}
+            {!videoSrc && (
+              <div className="relative">
+                {post.imageUrl && (
+                  <img src={post.imageUrl} alt="" className="w-full object-cover"
+                    style={{ maxHeight: "340px", display: "block" }} />
+                )}
+                {/* Play button overlay */}
+                <button
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={handlePlay}
+                  className="absolute inset-0 flex items-center justify-center"
+                  style={{ background: "rgba(0,0,0,0.25)" }}
+                  aria-label="Play video"
+                >
+                  <div className="flex items-center justify-center rounded-full"
+                    style={{ width: 52, height: 52, background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}>
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+                      <path d="M8 5v14l11-7z"/>
+                    </svg>
+                  </div>
+                </button>
+              </div>
+            )}
+            {videoSrc && (
+              <video
+                ref={videoRef}
+                src={videoSrc}
+                muted={muted}
+                playsInline
+                loop
+                preload="metadata"
+                className="w-full"
+                style={{ maxHeight: "340px", display: "block" }}
+              />
+            )}
+            {/* Mute toggle — only shown once video is loaded */}
+            {videoSrc && (
+              <button
+                onClick={() => setMuted((m) => !m)}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="absolute bottom-2 right-2 flex items-center justify-center rounded-full"
+                style={{ width: 32, height: 32, background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+              >
+                {muted ? (
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
+                    <path d="M16.5 12A4.5 4.5 0 0014 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25A6.956 6.956 0 0112 19c-.34 0-.68-.03-1-.08v2.06c.33.05.66.08 1 .02 1.85 0 3.57-.57 4.98-1.53l1.79 1.79L20 19.73 4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
+                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+                  </svg>
+                )}
+              </button>
+            )}
           </div>
         )}
 
