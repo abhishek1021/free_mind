@@ -953,29 +953,79 @@ function InstaFactCard({
 }
 
 function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: TelegramChannel }) {
-  const [muted, setMuted]         = useState(true);
-  const [imgLoaded, setImgLoaded] = useState(false);
-  const [imgError, setImgError]   = useState(false);
-  const [modal, setModal]         = useState(false);
-  const [videoSrc, setVideoSrc]   = useState<string | null>(null);
+  const [muted, setMuted]             = useState(true);
+  const [isPlaying, setIsPlaying]     = useState(false);
+  const [progress, setProgress]       = useState(0);    // 0–100
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration]       = useState(0);
+  const [ctrlVisible, setCtrlVisible] = useState(false);
+  const [imgLoaded, setImgLoaded]     = useState(false);
+  const [imgError, setImgError]       = useState(false);
+  const [modal, setModal]             = useState(false);
+  const [videoSrc, setVideoSrc]       = useState<string | null>(null);
+
   const videoRef     = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Ref so the intersection observer closure reads the latest value without
-  // causing the effect to re-subscribe on every videoSrc state change.
   const videoSrcRef  = useRef<string | null>(null);
+  const hideTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const longPress = useLongPress(() => setModal(true));
-
-  // mediaUrl is a CDN URL (not a proxy) when the video was already uploaded to
-  // S3. CDN videos support HTTP range requests and can autoplay safely.
-  // Proxy URLs (/api/telegram/media?…) are tap-to-play to avoid FLOOD_WAIT.
+  const longPress  = useLongPress(() => setModal(true));
   const isCdnVideo = post.hasVideo && !!post.mediaUrl && !post.mediaUrl.startsWith("/api/");
 
   const date = new Date(post.date * 1000).toLocaleDateString("en-US", {
     day: "numeric", month: "short", year: "numeric",
   });
 
-  // IntersectionObserver: autoplay CDN videos on enter; pause all videos on exit
+  useEffect(() => () => { if (hideTimer.current) clearTimeout(hideTimer.current); }, []);
+
+  function formatTime(s: number): string {
+    if (!isFinite(s) || s < 0) return "0:00";
+    const m   = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, "0")}`;
+  }
+
+  function revealControls() {
+    setCtrlVisible(true);
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    hideTimer.current = setTimeout(() => setCtrlVisible(false), 3000);
+  }
+
+  function handleVideoTap() {
+    if (videoSrc) revealControls();
+  }
+
+  function handlePlayPause(e: React.MouseEvent) {
+    e.stopPropagation();
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => {});
+    else          v.pause();
+    revealControls();
+  }
+
+  function handleSeek(e: React.ChangeEvent<HTMLInputElement>) {
+    e.stopPropagation();
+    const v = videoRef.current;
+    if (!v || !isFinite(duration) || duration === 0) return;
+    const pct = parseFloat(e.target.value);
+    v.currentTime = (pct / 100) * duration;
+    setProgress(pct);
+  }
+
+  function handleTimeUpdate() {
+    const v = videoRef.current;
+    if (!v) return;
+    setCurrentTime(v.currentTime);
+    if (isFinite(v.duration) && v.duration > 0) {
+      setProgress((v.currentTime / v.duration) * 100);
+    }
+  }
+
+  // Controls are visible when paused (always) or recently tapped (while playing)
+  const showControls = !!videoSrc && (!isPlaying || ctrlVisible);
+
+  // IntersectionObserver: autoplay CDN videos on enter; pause all on exit
   useEffect(() => {
     if (!post.hasVideo || !containerRef.current) return;
     const obs = new IntersectionObserver(
@@ -983,11 +1033,9 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
         if (entry.isIntersecting) {
           if (isCdnVideo && post.mediaUrl) {
             if (!videoSrcRef.current) {
-              // First entry: set src. onCanPlay fires when buffered and calls play().
               videoSrcRef.current = post.mediaUrl;
               setVideoSrc(post.mediaUrl);
             } else {
-              // Re-entry after scrolling away: src already set, just resume.
               videoRef.current?.play().catch(() => {});
             }
           }
@@ -1007,10 +1055,94 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
     if (!videoSrcRef.current) {
       videoSrcRef.current = post.mediaUrl;
       setVideoSrc(post.mediaUrl);
-      // onCanPlay will trigger play once the browser has buffered enough
     } else {
       videoRef.current?.play().catch(() => {});
     }
+  }
+
+  // Shared video event handlers
+  const videoEvents = {
+    onCanPlay:        () => { if (videoRef.current?.paused) videoRef.current.play().catch(() => {}); },
+    onPlay:           () => setIsPlaying(true),
+    onPause:          () => { setIsPlaying(false); setCtrlVisible(true); },
+    onTimeUpdate:     handleTimeUpdate,
+    onDurationChange: () => { const v = videoRef.current; if (v && isFinite(v.duration)) setDuration(v.duration); },
+  };
+
+  // Shared controls overlay (rendered over both CDN and proxy video elements)
+  function VideoControls() {
+    return (
+      <div
+        className="absolute bottom-0 left-0 right-0"
+        style={{
+          background: "linear-gradient(to top, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0) 100%)",
+          padding: "28px 10px 8px",
+          opacity: showControls ? 1 : 0,
+          transition: "opacity 0.25s ease",
+          pointerEvents: showControls ? "auto" : "none",
+        }}
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {/* Progress scrubber */}
+        <input
+          type="range"
+          min="0"
+          max="100"
+          step="0.2"
+          value={progress}
+          onChange={handleSeek}
+          className="video-scrubber"
+          style={{
+            background: `linear-gradient(to right, #fff ${progress}%, rgba(255,255,255,0.28) ${progress}%)`,
+            marginBottom: 7,
+          }}
+        />
+        {/* Controls row */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Play / Pause */}
+          <button
+            onClick={handlePlayPause}
+            style={{ color: "#fff", display: "flex", background: "none", border: "none", padding: 0, cursor: "pointer" }}
+            aria-label={isPlaying ? "Pause" : "Play"}
+          >
+            {isPlaying ? (
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
+                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            )}
+          </button>
+
+          {/* Time display */}
+          <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 11, fontVariantNumeric: "tabular-nums", letterSpacing: "0.02em", userSelect: "none" }}>
+            {formatTime(currentTime)}{duration > 0 ? ` / ${formatTime(duration)}` : ""}
+          </span>
+
+          <div style={{ flex: 1 }} />
+
+          {/* Mute / Unmute */}
+          <button
+            onClick={() => setMuted((m) => !m)}
+            style={{ color: "#fff", display: "flex", background: "none", border: "none", padding: 0, cursor: "pointer" }}
+            aria-label={muted ? "Unmute" : "Mute"}
+          >
+            {muted ? (
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="white">
+                <path d="M16.5 12A4.5 4.5 0 0014 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25A6.956 6.956 0 0112 19c-.34 0-.68-.03-1-.08v2.06c.33.05.66.08 1 .02 1.85 0 3.57-.57 4.98-1.53l1.79 1.79L20 19.73 4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="white">
+                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+              </svg>
+            )}
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -1032,9 +1164,14 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
         {...longPress}
       >
         {post.hasVideo && post.mediaUrl && (
-          <div ref={containerRef} className="relative w-full" style={{ background: "#000" }}>
+          <div
+            ref={containerRef}
+            className="relative w-full"
+            style={{ background: "#000" }}
+            onClick={handleVideoTap}
+          >
             {isCdnVideo ? (
-              /* CDN video: show poster until IntersectionObserver autoplays */
+              /* CDN video: poster shown until IntersectionObserver autoplays */
               <>
                 {!videoSrc && post.imageUrl && (
                   <img src={post.imageUrl} alt="" className="w-full object-cover"
@@ -1051,19 +1188,12 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
                     poster={post.imageUrl ?? undefined}
                     className="w-full"
                     style={{ maxHeight: "340px", display: "block" }}
-                    onCanPlay={() => {
-                      // Browser signals it has buffered enough to play.
-                      // Only autoplay when paused (avoids re-triggering while
-                      // already playing, e.g. after a seek).
-                      if (videoRef.current?.paused) {
-                        videoRef.current.play().catch(() => {});
-                      }
-                    }}
+                    {...videoEvents}
                   />
                 )}
               </>
             ) : (
-              /* Proxy video: tap-to-play to avoid FLOOD_WAIT on Telegram */
+              /* Proxy video: tap-to-play to avoid Telegram FLOOD_WAIT */
               <>
                 {!videoSrc && (
                   <div className="relative">
@@ -1073,14 +1203,14 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
                     )}
                     <button
                       onPointerDown={(e) => e.stopPropagation()}
-                      onClick={handlePlay}
+                      onClick={(e) => { e.stopPropagation(); handlePlay(); }}
                       className="absolute inset-0 flex items-center justify-center"
-                      style={{ background: "rgba(0,0,0,0.25)" }}
+                      style={{ background: "rgba(0,0,0,0.28)" }}
                       aria-label="Play video"
                     >
                       <div className="flex items-center justify-center rounded-full"
-                        style={{ width: 52, height: 52, background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}>
-                        <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+                        style={{ width: 54, height: 54, background: "rgba(0,0,0,0.65)", backdropFilter: "blur(6px)" }}>
+                        <svg viewBox="0 0 24 24" width="26" height="26" fill="white">
                           <path d="M8 5v14l11-7z"/>
                         </svg>
                       </div>
@@ -1097,34 +1227,14 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
                     preload="metadata"
                     className="w-full"
                     style={{ maxHeight: "340px", display: "block" }}
-                    onCanPlay={() => {
-                      if (videoRef.current?.paused) {
-                        videoRef.current.play().catch(() => {});
-                      }
-                    }}
+                    {...videoEvents}
                   />
                 )}
               </>
             )}
-            {/* Mute toggle — shown once video src is loaded */}
-            {videoSrc && (
-              <button
-                onClick={() => setMuted((m) => !m)}
-                onPointerDown={(e) => e.stopPropagation()}
-                className="absolute bottom-2 right-2 flex items-center justify-center rounded-full"
-                style={{ width: 32, height: 32, background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
-              >
-                {muted ? (
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
-                    <path d="M16.5 12A4.5 4.5 0 0014 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25A6.956 6.956 0 0112 19c-.34 0-.68-.03-1-.08v2.06c.33.05.66.08 1 .02 1.85 0 3.57-.57 4.98-1.53l1.79 1.79L20 19.73 4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
-                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                  </svg>
-                )}
-              </button>
-            )}
+
+            {/* Unified player controls overlay */}
+            {videoSrc && <VideoControls />}
           </div>
         )}
 
