@@ -10,15 +10,40 @@ export const maxDuration = 60;
 const S3_BUCKET = process.env.S3_MEDIA_BUCKET ?? "";
 const CDN_URL   = (process.env.CDN_MEDIA_URL ?? "").replace(/\/$/, "");
 
-// S3 client is only instantiated when the bucket env var is present.
-// On Amplify/Lambda the execution role supplies credentials automatically —
-// no access key or secret key needed in env vars.
 const s3 = S3_BUCKET
   ? new S3Client({ region: process.env.AWS_REGION ?? "us-east-1" })
   : null;
 
 function mediaKey(channel: string, msgId: number): string {
   return `telegram-media/${channel}/${msgId}`;
+}
+
+// ── Debug trace ───────────────────────────────────────────────────────────────
+// All debug info is returned as X-Debug-* response headers so it shows up
+// in DevTools → Network → click the media request → Headers tab.
+// No CloudWatch digging needed — everything visible in the browser.
+interface Trace {
+  s3Configured: boolean;
+  cdnConfigured: boolean;
+  s3Key: string;
+  s3Check: string;       // hit | miss | error:<code> | skipped
+  telegramFetch: string; // pending | success:<bytes> | error:<msg> | skipped
+  s3Upload: string;      // success | error:<code>:<msg> | skipped
+  path: string;          // cdn-redirect | s3-upload | direct-206 | direct-200 | error:<status>
+  awsRegion: string;
+}
+
+function debugHeaders(t: Trace): Record<string, string> {
+  return {
+    "X-Debug-S3-Configured":  String(t.s3Configured),
+    "X-Debug-CDN-Configured": String(t.cdnConfigured),
+    "X-Debug-S3-Key":         t.s3Key,
+    "X-Debug-S3-Check":       t.s3Check,
+    "X-Debug-Telegram-Fetch": t.telegramFetch,
+    "X-Debug-S3-Upload":      t.s3Upload,
+    "X-Debug-Path":           t.path,
+    "X-Debug-AWS-Region":     t.awsRegion,
+  };
 }
 
 export async function GET(req: NextRequest) {
@@ -32,35 +57,63 @@ export async function GET(req: NextRequest) {
 
   const key = mediaKey(channel, msgId);
 
-  // ── 1. Check S3 cache ───────────────────────────────────────────────────────
-  // HeadObject uses s3:GetObject IAM permission (AWS maps it internally).
-  // A 302 redirect to CloudFront means the client fetches bytes from the CDN
-  // edge — zero Lambda bandwidth, no Telegram call, no FLOOD_WAIT risk.
+  const trace: Trace = {
+    s3Configured:  !!s3,
+    cdnConfigured: !!CDN_URL,
+    s3Key:         key,
+    s3Check:       "skipped",
+    telegramFetch: "skipped",
+    s3Upload:      "skipped",
+    path:          "unknown",
+    awsRegion:     process.env.AWS_REGION ?? "not-set(defaulting-to-us-east-1)",
+  };
+
+  // ── 1. S3 cache check ─────────────────────────────────────────────────────
   if (s3 && CDN_URL) {
     try {
       await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: key }));
-      console.log(`[media] CDN cache hit: ${key}`);
-      return Response.redirect(`${CDN_URL}/${key}`, 302);
+      trace.s3Check = "hit";
+      trace.path    = "cdn-redirect";
+      console.log(`[media] CDN cache hit → redirect: ${key}`);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          "Location": `${CDN_URL}/${key}`,
+          ...debugHeaders(trace),
+        },
+      });
     } catch (err) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const e = err as any;
-      const status = e?.$metadata?.httpStatusCode;
+      const e      = err as any;
+      const status = e?.$metadata?.httpStatusCode ?? "unknown";
+      const name   = e?.name ?? "UnknownError";
+
       if (status === 403) {
-        console.error("[media] S3 HeadObject 403 — IAM role missing s3:GetObject on freemind-telegram-media. Check Lambda execution role.");
-      } else if (status !== 404) {
-        console.warn("[media] S3 HeadObject unexpected error:", e?.name, status, e?.message);
+        trace.s3Check = `error:403-AccessDenied`;
+        console.error(`[media] S3 HeadObject 403 AccessDenied — Lambda execution role does not have s3:GetObject on ${S3_BUCKET}. Bucket: ${S3_BUCKET}, Key: ${key}, Region: ${trace.awsRegion}`);
+      } else if (status === 404) {
+        trace.s3Check = "miss";
+        console.log(`[media] S3 miss → fetching from Telegram: ${key}`);
+      } else {
+        trace.s3Check = `error:${status}-${name}`;
+        console.warn(`[media] S3 HeadObject unexpected error: status=${status} name=${name} msg=${e?.message}`);
       }
-      // 404 = not cached yet → fall through to Telegram fetch
     }
+  } else {
+    trace.s3Check = `skipped(s3=${!!s3},cdn=${!!CDN_URL},bucket="${S3_BUCKET}")`;
+    console.warn(`[media] S3 not configured — s3=${!!s3} CDN_URL="${CDN_URL}" S3_BUCKET="${S3_BUCKET}"`);
   }
 
-  // ── 2. Fetch from Telegram (first-time only) ────────────────────────────────
+  // ── 2. Fetch from Telegram ────────────────────────────────────────────────
   try {
     return await withTelegramClient(async (client) => {
+      trace.telegramFetch = "pending";
       const [msg] = await client.getMessages(channel, { ids: [msgId] });
 
       if (!msg?.media) {
-        return new Response("No media", { status: 404 });
+        trace.telegramFetch = "error:no-media";
+        trace.path = "error:404";
+        return new Response("No media", { status: 404, headers: debugHeaders(trace) });
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -71,7 +124,9 @@ export async function GET(req: NextRequest) {
       const fileSize: number = doc?.size ?? 0;
 
       if (fileSize > 80 * 1024 * 1024) {
-        return new Response("File too large (>80 MB)", { status: 413 });
+        trace.telegramFetch = `error:file-too-large(${fileSize}bytes)`;
+        trace.path = "error:413";
+        return new Response("File too large (>80 MB)", { status: 413, headers: debugHeaders(trace) });
       }
 
       // Build Telegram file location
@@ -79,10 +134,10 @@ export async function GET(req: NextRequest) {
 
       if (msg.photo) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const photo  = msg.photo as any;
+        const photo = msg.photo as any;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const sizes: any[] = photo.sizes ?? [];
-        const thumbSize    = sizes[sizes.length - 1]?.type ?? "s";
+        const thumbSize = sizes[sizes.length - 1]?.type ?? "s";
         fileLocation = new Api.InputPhotoFileLocation({
           id: photo.id,
           accessHash: photo.accessHash,
@@ -99,11 +154,13 @@ export async function GET(req: NextRequest) {
       }
 
       if (!fileLocation) {
-        return new Response("Cannot locate file", { status: 500 });
+        trace.telegramFetch = "error:no-file-location";
+        trace.path = "error:500";
+        return new Response("Cannot locate file", { status: 500, headers: debugHeaders(trace) });
       }
 
-      // Buffer the entire file from Telegram
-      const loc    = fileLocation;
+      // Buffer the file
+      const loc = fileLocation;
       const chunks: Uint8Array[] = [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       for await (const chunk of (client as any).iterDownload({
@@ -117,9 +174,10 @@ export async function GET(req: NextRequest) {
       let off = 0;
       for (const c of chunks) { body.set(c, off); off += c.length; }
 
-      // ── 3. Upload to S3, then redirect to CloudFront ──────────────────────
-      // After this point every future request for this media goes direct to CDN —
-      // no Lambda, no Telegram, no FLOOD_WAIT — forever.
+      trace.telegramFetch = `success:${totalBytes}bytes:${mimeType}`;
+      console.log(`[media] Telegram fetch OK: ${key} ${totalBytes} bytes (${mimeType})`);
+
+      // ── 3. Upload to S3 → redirect to CloudFront ──────────────────────────
       if (s3 && CDN_URL) {
         try {
           await s3.send(new PutObjectCommand({
@@ -129,27 +187,40 @@ export async function GET(req: NextRequest) {
             ContentType:  mimeType,
             CacheControl: "public, max-age=31536000, immutable",
           }));
-          console.log(`[media] uploaded to S3: ${key} (${totalBytes} bytes)`);
-          return Response.redirect(`${CDN_URL}/${key}`, 302);
+          trace.s3Upload = `success:${totalBytes}bytes`;
+          trace.path     = "s3-upload-then-cdn-redirect";
+          console.log(`[media] S3 upload OK → redirect to CDN: ${key}`);
+          return new Response(null, {
+            status: 302,
+            headers: {
+              "Location": `${CDN_URL}/${key}`,
+              ...debugHeaders(trace),
+            },
+          });
         } catch (uploadErr) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const e = uploadErr as any;
-          console.error("[media] S3 upload failed:", e?.name, e?.Code, e?.$metadata?.httpStatusCode, e?.message);
-          // If S3 is unavailable, return 503 rather than trying to stream
-          // a large video through Lambda (which hits the 6MB response limit → 413).
-          return new Response("Media storage unavailable — try again shortly", { status: 503 });
+          const e      = uploadErr as any;
+          const status = e?.$metadata?.httpStatusCode ?? "unknown";
+          const name   = e?.name ?? "UnknownError";
+          trace.s3Upload = `error:${status}-${name}:${e?.message ?? ""}`;
+          trace.path     = "error:503";
+          console.error(`[media] S3 PutObject failed: status=${status} name=${name} bucket=${S3_BUCKET} key=${key} msg=${e?.message}`);
+          return new Response(
+            `S3 upload failed: ${name} (${status}) — ${e?.message}`,
+            { status: 503, headers: debugHeaders(trace) }
+          );
         }
       }
 
-      // ── 4. Fallback: serve directly (local dev or S3 unavailable) ────────
-      // CloudFront/S3 handles range requests natively when the redirect works.
-      // This fallback supports range requests for iOS Safari video playback.
+      // ── 4. Fallback: serve directly (local dev — S3 not configured) ───────
+      trace.s3Upload = "skipped:s3-not-configured";
       const rangeHeader = req.headers.get("range");
       if (rangeHeader?.startsWith("bytes=")) {
         const [s, e] = rangeHeader.replace("bytes=", "").split("-");
         const start  = parseInt(s) || 0;
         const end    = e ? parseInt(e) : totalBytes - 1;
         const slice  = body.slice(start, end + 1);
+        trace.path = "direct-206-fallback";
         return new Response(slice, {
           status: 206,
           headers: {
@@ -158,33 +229,45 @@ export async function GET(req: NextRequest) {
             "Accept-Ranges":  "bytes",
             "Content-Length": String(slice.length),
             "Cache-Control":  "public, max-age=3600",
+            ...debugHeaders(trace),
           },
         });
       }
 
+      trace.path = "direct-200-fallback";
       return new Response(body, {
         headers: {
           "Content-Type":   mimeType,
           "Accept-Ranges":  "bytes",
           "Content-Length": String(totalBytes),
           "Cache-Control":  "public, max-age=3600",
+          ...debugHeaders(trace),
         },
       });
     });
   } catch (err) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const code = (err as any)?.code;
+    const e      = err as any;
+    const code   = e?.code;
     const errStr = String(err);
+
     if (code === 420 || errStr.includes("FLOOD")) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const seconds = (err as any)?.seconds ?? 60;
-      console.warn(`[media] FLOOD_WAIT ${seconds}s`);
+      const seconds = e?.seconds ?? 60;
+      trace.telegramFetch = `error:FLOOD_WAIT:${seconds}s`;
+      trace.path = "error:429";
+      console.warn(`[media] FLOOD_WAIT ${seconds}s for ${key}`);
       return new Response("Rate limited", {
         status: 429,
-        headers: { "Retry-After": String(seconds) },
+        headers: { "Retry-After": String(seconds), ...debugHeaders(trace) },
       });
     }
-    console.error("[media]", err);
-    return new Response("Error fetching media", { status: 500 });
+
+    trace.telegramFetch = `error:${errStr.slice(0, 120)}`;
+    trace.path = "error:500";
+    console.error(`[media] Telegram error for ${key}:`, err);
+    return new Response("Error fetching media", {
+      status: 500,
+      headers: debugHeaders(trace),
+    });
   }
 }
