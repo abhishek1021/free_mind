@@ -116,7 +116,16 @@ export default function Feed() {
 
     for (const ch of picks) {
       try {
-        const res  = await fetch(`/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=5`);
+        // Pick a random point in the channel's recent history so each refresh
+        // surfaces different posts. 40% chance to get the very latest (no offset);
+        // otherwise pick a random date between 1 and 60 days ago.
+        const useOffset = Math.random() > 0.4;
+        const offsetDate = useOffset
+          ? Math.floor(Date.now() / 1000) - (1 + Math.floor(Math.random() * 59)) * 86400
+          : undefined;
+
+        const url = `/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=5${offsetDate ? `&offsetDate=${offsetDate}` : ""}`;
+        const res  = await fetch(url);
         const data = await res.json();
         const posts: TelegramPost[] = data.posts ?? [];
         const fresh = posts.filter((p) => !seenPostIds.current.has(`${ch.username}-${p.id}`));

@@ -148,9 +148,13 @@ async function getThumbnail(
 // limit controls both how many messages are fetched and how many thumbnails are
 // downloaded. Keeping it small (e.g. 5 for feed) prevents exhausting the
 // auth.ExportAuthorization rate limit (Telegram error 420 FLOOD_WAIT).
-async function fetchFromTelegram(channel: string, limit: number): Promise<TelegramPost[]> {
+// offsetDate is a Unix timestamp (seconds); Telegram returns messages OLDER
+// than this date, giving historical variety on each feed refresh.
+async function fetchFromTelegram(channel: string, limit: number, offsetDate?: number): Promise<TelegramPost[]> {
   return withTelegramClient(async (client) => {
-    const messages = await client.getMessages(channel, { limit });
+    const msgOpts: Record<string, unknown> = { limit };
+    if (offsetDate) msgOpts.offsetDate = offsetDate;
+    const messages = await client.getMessages(channel, msgOpts);
     const posts: TelegramPost[] = [];
 
     for (const msg of messages) {
@@ -215,15 +219,35 @@ async function warmCache(channel: string): Promise<void> {
 
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
-  const channel  = (searchParams.get("channel") ?? "").replace(/^@/, "");
-  const initial  = searchParams.get("initial") === "1";
-  const limit    = Math.min(parseInt(searchParams.get("limit") ?? "20"), MAX_POOL_SIZE);
+  const channel    = (searchParams.get("channel") ?? "").replace(/^@/, "");
+  const initial    = searchParams.get("initial") === "1";
+  const limit      = Math.min(parseInt(searchParams.get("limit") ?? "20"), MAX_POOL_SIZE);
+  // offsetDate: Unix timestamp (seconds). When provided, Telegram returns
+  // messages older than this date, giving variety across refreshes.
+  // Cache is bypassed for these requests — they are intentionally non-latest.
+  const offsetDate = searchParams.get("offsetDate") ? parseInt(searchParams.get("offsetDate")!) : undefined;
 
   if (!process.env.TELEGRAM_SESSION || !process.env.TELEGRAM_API_ID) {
     return NextResponse.json({ error: "Telegram credentials not configured" }, { status: 500 });
   }
   if (!channel) {
     return NextResponse.json({ error: "Missing channel param" }, { status: 400 });
+  }
+
+  // ── Time-offset request: bypass cache, fetch historical posts directly ──────
+  if (offsetDate) {
+    try {
+      let posts = await fetchFromTelegram(channel, limit, offsetDate);
+      // If no posts found at that timestamp (sparse channel), fall back to latest
+      if (posts.length === 0) {
+        posts = await fetchFromTelegram(channel, limit);
+      }
+      const slice = shuffle(posts).slice(0, limit);
+      return NextResponse.json({ posts: slice, channel, cached: false, offsetDate });
+    } catch (err) {
+      console.error("[telegram/posts] offsetDate fetch failed:", err);
+      // On error, fall through to normal cache path below
+    }
   }
 
   const entry = postCache.get(channel);
