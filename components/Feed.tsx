@@ -972,10 +972,15 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
     const obs = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {
-          if (isCdnVideo && post.mediaUrl && !videoSrcRef.current) {
-            videoSrcRef.current = post.mediaUrl;
-            setVideoSrc(post.mediaUrl);
-            setTimeout(() => videoRef.current?.play().catch(() => {}), 0);
+          if (isCdnVideo && post.mediaUrl) {
+            if (!videoSrcRef.current) {
+              // First entry: set src. onCanPlay fires when buffered and calls play().
+              videoSrcRef.current = post.mediaUrl;
+              setVideoSrc(post.mediaUrl);
+            } else {
+              // Re-entry after scrolling away: src already set, just resume.
+              videoRef.current?.play().catch(() => {});
+            }
           }
         } else {
           videoRef.current?.pause();
@@ -993,7 +998,7 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
     if (!videoSrcRef.current) {
       videoSrcRef.current = post.mediaUrl;
       setVideoSrc(post.mediaUrl);
-      setTimeout(() => videoRef.current?.play().catch(() => {}), 0);
+      // onCanPlay will trigger play once the browser has buffered enough
     } else {
       videoRef.current?.play().catch(() => {});
     }
@@ -1033,10 +1038,18 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
                     muted={muted}
                     playsInline
                     loop
-                    preload="metadata"
+                    preload="auto"
                     poster={post.imageUrl ?? undefined}
                     className="w-full"
                     style={{ maxHeight: "340px", display: "block" }}
+                    onCanPlay={() => {
+                      // Browser signals it has buffered enough to play.
+                      // Only autoplay when paused (avoids re-triggering while
+                      // already playing, e.g. after a seek).
+                      if (videoRef.current?.paused) {
+                        videoRef.current.play().catch(() => {});
+                      }
+                    }}
                   />
                 )}
               </>
@@ -1075,6 +1088,11 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
                     preload="metadata"
                     className="w-full"
                     style={{ maxHeight: "340px", display: "block" }}
+                    onCanPlay={() => {
+                      if (videoRef.current?.paused) {
+                        videoRef.current.play().catch(() => {});
+                      }
+                    }}
                   />
                 )}
               </>
