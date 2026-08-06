@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { withTelegramClient } from "@/lib/telegram-client";
+import { Api } from "telegram";
+import { s3, mediaKey, cdnUrl, existsInS3, uploadToS3 } from "@/lib/s3-media";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 45;
@@ -18,7 +20,6 @@ export interface TelegramPost {
 // ── Server-side post cache ────────────────────────────────────────────────────
 const CACHE_TTL_MS         = 5 * 60 * 1000;
 const BACKGROUND_REFRESH_MS = 4 * 60 * 1000;
-// Maximum posts to fetch for channel-tab view; feed calls pass smaller limits
 const MAX_POOL_SIZE = 20;
 
 interface CacheEntry { posts: TelegramPost[]; fetchedAt: number; refreshing: boolean; }
@@ -31,6 +32,117 @@ function shuffle<T>(arr: T[]): T[] {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+// ── Background video upload ───────────────────────────────────────────────────
+// After fetchFromTelegram returns proxy URLs for new videos, we fire-and-forget
+// a full video download + S3 upload. On the next cache refresh, existsInS3()
+// returns true and the post gets a CDN mediaUrl, enabling autoplay.
+const videoUploadInFlight = new Set<string>();
+
+function updateCacheMediaUrl(channel: string, msgId: number, url: string): void {
+  const entry = postCache.get(channel);
+  if (!entry) return;
+  for (const post of entry.posts) {
+    if (post.id === msgId && post.hasVideo) post.mediaUrl = url;
+  }
+}
+
+function scheduleVideoUpload(channel: string, msgId: number): void {
+  if (!s3) return;
+  const key = mediaKey(channel, msgId);
+  if (videoUploadInFlight.has(key)) return;
+  videoUploadInFlight.add(key);
+
+  ;(async () => {
+    try {
+      if (await existsInS3(key)) {
+        updateCacheMediaUrl(channel, msgId, cdnUrl(key));
+        return;
+      }
+      await withTelegramClient(async (client) => {
+        const [msg] = await client.getMessages(channel, { ids: [msgId] });
+        if (!msg?.document) return;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const doc = msg.document as any;
+        if (!doc.mimeType?.startsWith("video/")) return;
+        const fileSize: number = doc.size ?? 0;
+        if (fileSize > 80 * 1024 * 1024) {
+          console.warn(`[telegram/posts] bg-upload: video too large (${fileSize}b) — skipping ${key}`);
+          return;
+        }
+        const fileLocation = new Api.InputDocumentFileLocation({
+          id: doc.id,
+          accessHash: doc.accessHash,
+          fileReference: doc.fileReference,
+          thumbSize: "",
+        });
+        const chunks: Uint8Array[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for await (const chunk of (client as any).iterDownload({
+          file: fileLocation,
+          requestSize: 512 * 1024,
+        })) {
+          chunks.push(new Uint8Array(chunk as Buffer));
+        }
+        const totalBytes = chunks.reduce((n, c) => n + c.length, 0);
+        const body = new Uint8Array(totalBytes);
+        let off = 0;
+        for (const c of chunks) { body.set(c, off); off += c.length; }
+        await uploadToS3(key, body, doc.mimeType);
+        console.log(`[telegram/posts] bg-upload done: ${key} (${totalBytes}b)`);
+        updateCacheMediaUrl(channel, msgId, cdnUrl(key));
+      });
+    } catch (err) {
+      console.warn(`[telegram/posts] bg-upload failed for ${key}:`, err);
+    } finally {
+      videoUploadInFlight.delete(key);
+    }
+  })();
+}
+
+// ── Helper: upload thumbnail to S3, return CDN URL; fallback to base64 ───────
+async function getThumbnail(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  media: any,
+  thumbKey: string,
+): Promise<string | null> {
+  if (s3) {
+    // S3 configured → check cache or upload
+    try {
+      if (await existsInS3(thumbKey)) return cdnUrl(thumbKey);
+      const thumb = await client.downloadMedia(media, { thumb: 1 }) as Buffer | undefined;
+      if (thumb?.length) return await uploadToS3(thumbKey, thumb, "image/jpeg");
+      const thumb0 = await client.downloadMedia(media, { thumb: 0 }) as Buffer | undefined;
+      if (thumb0?.length) return await uploadToS3(thumbKey, thumb0, "image/jpeg");
+      return null;
+    } catch (err) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((err as any)?.code === 420 || String(err).includes("FLOOD")) {
+        console.warn(`[telegram/posts] FLOOD_WAIT during thumbnail upload — skipping`);
+      } else {
+        console.warn(`[telegram/posts] thumbnail S3 error:`, err);
+      }
+      return null;
+    }
+  } else {
+    // No S3 → inline base64 fallback
+    try {
+      const thumb = await client.downloadMedia(media, { thumb: 1 }) as Buffer | undefined;
+      if (thumb?.length) return `data:image/jpeg;base64,${thumb.toString("base64")}`;
+      const thumb0 = await client.downloadMedia(media, { thumb: 0 }) as Buffer | undefined;
+      if (thumb0?.length) return `data:image/jpeg;base64,${thumb0.toString("base64")}`;
+      return null;
+    } catch (err) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((err as any)?.code === 420 || String(err).includes("FLOOD")) {
+        console.warn(`[telegram/posts] FLOOD_WAIT during thumbnail download — skipping`);
+      }
+      return null;
+    }
+  }
 }
 
 // limit controls both how many messages are fetched and how many thumbnails are
@@ -51,48 +163,24 @@ async function fetchFromTelegram(channel: string, limit: number): Promise<Telegr
       if (msg.media) {
         try {
           if (msg.photo) {
-            // Keep mediaUrl for full-size (long-press modal only)
+            // Full photo served via proxy (handles S3 → CDN redirect automatically)
             mediaUrl = `/api/telegram/media?channel=${encodeURIComponent(channel)}&msgId=${msg.id}&type=photo`;
-            // Download a small thumbnail inline — avoids 20 separate media proxy
-            // connections firing simultaneously when posts render on screen.
-            try {
-              const thumb = await client.downloadMedia(msg.media, { thumb: 1 }) as Buffer | undefined;
-              if (thumb?.length) {
-                imageUrl = `data:image/jpeg;base64,${thumb.toString("base64")}`;
-              } else {
-                const thumb0 = await client.downloadMedia(msg.media, { thumb: 0 }) as Buffer | undefined;
-                imageUrl = thumb0?.length ? `data:image/jpeg;base64,${thumb0.toString("base64")}` : null;
-              }
-            } catch (thumbErr) {
-              // FLOOD_WAIT on auth.ExportAuthorization: file is on another DC and
-              // Telegram rate-limited the cross-DC auth. Skip thumbnail — don't fall
-              // back to mediaUrl which would cause another cross-DC request on render.
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              if ((thumbErr as any)?.code === 420 || String(thumbErr).includes("FLOOD")) {
-                console.warn(`[telegram/posts] FLOOD_WAIT during thumbnail for msg ${msg.id} — skipping`);
-              }
-              imageUrl = null;
-            }
+            imageUrl = await getThumbnail(client, msg.media, mediaKey(channel, msg.id, "-thumb"));
           } else if (msg.document) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const mime: string = (msg.document as any).mimeType ?? "";
             if (mime.startsWith("video/")) {
               hasVideo = true;
-              mediaUrl = `/api/telegram/media?channel=${encodeURIComponent(channel)}&msgId=${msg.id}`;
-              try {
-                const thumb = await client.downloadMedia(msg.media, { thumb: 1 }) as Buffer | undefined;
-                if (thumb?.length) imageUrl = `data:image/jpeg;base64,${thumb.toString("base64")}`;
-              } catch (thumbErr) {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                if ((thumbErr as any)?.code === 420 || String(thumbErr).includes("FLOOD")) {
-                  console.warn(`[telegram/posts] FLOOD_WAIT during video thumb for msg ${msg.id} — skipping`);
-                } else {
-                  try {
-                    const thumb = await client.downloadMedia(msg.media, { thumb: 0 }) as Buffer | undefined;
-                    if (thumb?.length) imageUrl = `data:image/jpeg;base64,${thumb.toString("base64")}`;
-                  } catch { /* no thumbnail */ }
-                }
+              const videoKey = mediaKey(channel, msg.id);
+              // If video already in S3 → CDN URL enables autoplay in Feed.tsx
+              if (s3 && await existsInS3(videoKey)) {
+                mediaUrl = cdnUrl(videoKey);
+              } else {
+                // Not yet in S3 → proxy URL; schedule background upload
+                mediaUrl = `/api/telegram/media?channel=${encodeURIComponent(channel)}&msgId=${msg.id}`;
+                scheduleVideoUpload(channel, msg.id);
               }
+              imageUrl = await getThumbnail(client, msg.media, mediaKey(channel, msg.id, "-thumb"));
             } else if (mime.startsWith("image/")) {
               mediaUrl = `/api/telegram/media?channel=${encodeURIComponent(channel)}&msgId=${msg.id}`;
               imageUrl = mediaUrl;
@@ -109,11 +197,9 @@ async function fetchFromTelegram(channel: string, limit: number): Promise<Telegr
 }
 
 // Warm or refresh a single channel's cache entry.
-// Uses a small limit (5) to minimise auth.ExportAuthorization calls —
-// the channel tab will trigger a larger fetch when the user opens it.
 async function warmCache(channel: string): Promise<void> {
   const entry = postCache.get(channel);
-  if (entry?.refreshing) return; // already in flight
+  if (entry?.refreshing) return;
 
   if (entry) entry.refreshing = true;
   try {
@@ -130,7 +216,6 @@ async function warmCache(channel: string): Promise<void> {
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
   const channel  = (searchParams.get("channel") ?? "").replace(/^@/, "");
-  // initial=1 → return only first 10 posts for fast first render
   const initial  = searchParams.get("initial") === "1";
   const limit    = Math.min(parseInt(searchParams.get("limit") ?? "20"), MAX_POOL_SIZE);
 
@@ -148,12 +233,10 @@ export async function GET(req: NextRequest) {
   if (entry && now - entry.fetchedAt < CACHE_TTL_MS) {
     const want = initial ? Math.min(limit, 10) : limit;
     if (entry.posts.length >= want) {
-      // Trigger background refresh when stale or cache has fewer posts than max
       if (!entry.refreshing && (
         now - entry.fetchedAt > BACKGROUND_REFRESH_MS ||
         entry.posts.length < limit
       )) {
-        // Background-fetch with the full requested limit to top up cache
         ;(async () => {
           const entry2 = postCache.get(channel);
           if (entry2?.refreshing) return;
@@ -168,13 +251,11 @@ export async function GET(req: NextRequest) {
       console.log(`[telegram/posts] cache hit @${channel} → ${slice.length} posts`);
       return NextResponse.json({ posts: slice, channel, cached: true });
     }
-    // Cache exists but has fewer posts than requested — fall through to re-fetch
   }
 
   // ── Cache miss or insufficient posts — fetch from Telegram ─────────────────
   try {
     const posts = await fetchFromTelegram(channel, limit);
-    // Merge with any existing cached posts so we don't lose previously fetched ones
     const existing = entry?.posts ?? [];
     const seenIds  = new Set(posts.map((p) => p.id));
     const merged   = [...posts, ...existing.filter((p) => !seenIds.has(p.id))];
@@ -184,7 +265,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ posts: slice, channel, cached: false });
   } catch (err) {
     console.error("[telegram/posts]", err);
-    // Serve stale cache rather than failing
     if (entry) {
       const want = initial ? Math.min(limit, 10) : limit;
       const slice = shuffle(entry.posts).slice(0, want);
@@ -194,9 +274,8 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// Prefetch endpoint — called by the client when the user lands on the channels tab.
-// Warms channels one-at-a-time (staggered) to avoid multiple simultaneous Telegram
-// connections from different Lambda instances triggering AUTH_KEY_DUPLICATED.
+// Prefetch endpoint — warms channels one-at-a-time to avoid concurrent Telegram
+// connections from different Lambda instances.
 export async function POST(req: NextRequest) {
   try {
     const { channels }: { channels: string[] } = await req.json();
@@ -208,15 +287,13 @@ export async function POST(req: NextRequest) {
       return !entry || now - entry.fetchedAt > BACKGROUND_REFRESH_MS;
     });
 
-    // Stagger warmups: one every 800ms so only one Telegram connection is active at a time
     ;(async () => {
       for (const ch of todo) {
-        await warmCache(ch);                              // sequential — not parallel
-        await new Promise(r => setTimeout(r, 800));      // breathe between channels
+        await warmCache(ch);
+        await new Promise(r => setTimeout(r, 800));
       }
     })();
 
-    // Respond immediately — warming runs in the background
     return NextResponse.json({ ok: true, queued: todo.length }, { status: 202 });
   } catch {
     return NextResponse.json({ ok: false }, { status: 400 });

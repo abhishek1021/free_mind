@@ -948,35 +948,51 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
   const [imgLoaded, setImgLoaded] = useState(false);
   const [imgError, setImgError]   = useState(false);
   const [modal, setModal]         = useState(false);
-  // videoSrc is only set when user explicitly taps the play button.
-  // Auto-loading on scroll triggers auth.ExportAuthorization for each cross-DC
-  // file, quickly hitting Telegram's FLOOD_WAIT rate limit (error 420).
   const [videoSrc, setVideoSrc]   = useState<string | null>(null);
   const videoRef     = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Ref so the intersection observer closure reads the latest value without
+  // causing the effect to re-subscribe on every videoSrc state change.
+  const videoSrcRef  = useRef<string | null>(null);
 
   const longPress = useLongPress(() => setModal(true));
+
+  // mediaUrl is a CDN URL (not a proxy) when the video was already uploaded to
+  // S3. CDN videos support HTTP range requests and can autoplay safely.
+  // Proxy URLs (/api/telegram/media?…) are tap-to-play to avoid FLOOD_WAIT.
+  const isCdnVideo = post.hasVideo && !!post.mediaUrl && !post.mediaUrl.startsWith("/api/");
 
   const date = new Date(post.date * 1000).toLocaleDateString("en-US", {
     day: "numeric", month: "short", year: "numeric",
   });
 
-  // Pause video when it leaves the viewport (no auto-play — only pause)
+  // IntersectionObserver: autoplay CDN videos on enter; pause all videos on exit
   useEffect(() => {
     if (!post.hasVideo || !containerRef.current) return;
     const obs = new IntersectionObserver(
-      ([entry]) => { if (!entry.isIntersecting) videoRef.current?.pause(); },
-      { threshold: 0.1 }
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          if (isCdnVideo && post.mediaUrl && !videoSrcRef.current) {
+            videoSrcRef.current = post.mediaUrl;
+            setVideoSrc(post.mediaUrl);
+            setTimeout(() => videoRef.current?.play().catch(() => {}), 0);
+          }
+        } else {
+          videoRef.current?.pause();
+        }
+      },
+      { threshold: 0.5 }
     );
     obs.observe(containerRef.current);
     return () => obs.disconnect();
-  }, [post.hasVideo]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [post.hasVideo, post.mediaUrl, isCdnVideo]);
 
   function handlePlay() {
     if (!post.mediaUrl) return;
-    if (!videoSrc) {
+    if (!videoSrcRef.current) {
+      videoSrcRef.current = post.mediaUrl;
       setVideoSrc(post.mediaUrl);
-      // Allow one microtask for React to set src before calling play()
       setTimeout(() => videoRef.current?.play().catch(() => {}), 0);
     } else {
       videoRef.current?.play().catch(() => {});
@@ -1003,43 +1019,67 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
       >
         {post.hasVideo && post.mediaUrl && (
           <div ref={containerRef} className="relative w-full" style={{ background: "#000" }}>
-            {/* Poster image always shown; tap play button to load the video */}
-            {!videoSrc && (
-              <div className="relative">
-                {post.imageUrl && (
+            {isCdnVideo ? (
+              /* CDN video: show poster until IntersectionObserver autoplays */
+              <>
+                {!videoSrc && post.imageUrl && (
                   <img src={post.imageUrl} alt="" className="w-full object-cover"
                     style={{ maxHeight: "340px", display: "block" }} />
                 )}
-                {/* Play button overlay */}
-                <button
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={handlePlay}
-                  className="absolute inset-0 flex items-center justify-center"
-                  style={{ background: "rgba(0,0,0,0.25)" }}
-                  aria-label="Play video"
-                >
-                  <div className="flex items-center justify-center rounded-full"
-                    style={{ width: 52, height: 52, background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}>
-                    <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
-                      <path d="M8 5v14l11-7z"/>
-                    </svg>
+                {videoSrc && (
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    muted={muted}
+                    playsInline
+                    loop
+                    preload="metadata"
+                    poster={post.imageUrl ?? undefined}
+                    className="w-full"
+                    style={{ maxHeight: "340px", display: "block" }}
+                  />
+                )}
+              </>
+            ) : (
+              /* Proxy video: tap-to-play to avoid FLOOD_WAIT on Telegram */
+              <>
+                {!videoSrc && (
+                  <div className="relative">
+                    {post.imageUrl && (
+                      <img src={post.imageUrl} alt="" className="w-full object-cover"
+                        style={{ maxHeight: "340px", display: "block" }} />
+                    )}
+                    <button
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={handlePlay}
+                      className="absolute inset-0 flex items-center justify-center"
+                      style={{ background: "rgba(0,0,0,0.25)" }}
+                      aria-label="Play video"
+                    >
+                      <div className="flex items-center justify-center rounded-full"
+                        style={{ width: 52, height: 52, background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}>
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+                          <path d="M8 5v14l11-7z"/>
+                        </svg>
+                      </div>
+                    </button>
                   </div>
-                </button>
-              </div>
+                )}
+                {videoSrc && (
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    muted={muted}
+                    playsInline
+                    loop
+                    preload="metadata"
+                    className="w-full"
+                    style={{ maxHeight: "340px", display: "block" }}
+                  />
+                )}
+              </>
             )}
-            {videoSrc && (
-              <video
-                ref={videoRef}
-                src={videoSrc}
-                muted={muted}
-                playsInline
-                loop
-                preload="metadata"
-                className="w-full"
-                style={{ maxHeight: "340px", display: "block" }}
-              />
-            )}
-            {/* Mute toggle — only shown once video is loaded */}
+            {/* Mute toggle — shown once video src is loaded */}
             {videoSrc && (
               <button
                 onClick={() => setMuted((m) => !m)}
