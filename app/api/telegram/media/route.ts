@@ -43,9 +43,12 @@ export async function GET(req: NextRequest) {
       return Response.redirect(`${CDN_URL}/${key}`, 302);
     } catch (err) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const status = (err as any)?.$metadata?.httpStatusCode;
-      if (status !== 404 && status !== 403) {
-        console.warn("[media] S3 HeadObject unexpected error:", err);
+      const e = err as any;
+      const status = e?.$metadata?.httpStatusCode;
+      if (status === 403) {
+        console.error("[media] S3 HeadObject 403 — IAM role missing s3:GetObject on freemind-telegram-media. Check Lambda execution role.");
+      } else if (status !== 404) {
+        console.warn("[media] S3 HeadObject unexpected error:", e?.name, status, e?.message);
       }
       // 404 = not cached yet → fall through to Telegram fetch
     }
@@ -129,8 +132,12 @@ export async function GET(req: NextRequest) {
           console.log(`[media] uploaded to S3: ${key} (${totalBytes} bytes)`);
           return Response.redirect(`${CDN_URL}/${key}`, 302);
         } catch (uploadErr) {
-          console.error("[media] S3 upload failed — serving directly:", uploadErr);
-          // Fall through to serve directly if S3 is unavailable
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const e = uploadErr as any;
+          console.error("[media] S3 upload failed:", e?.name, e?.Code, e?.$metadata?.httpStatusCode, e?.message);
+          // If S3 is unavailable, return 503 rather than trying to stream
+          // a large video through Lambda (which hits the 6MB response limit → 413).
+          return new Response("Media storage unavailable — try again shortly", { status: 503 });
         }
       }
 
