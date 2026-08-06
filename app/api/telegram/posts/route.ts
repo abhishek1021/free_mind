@@ -248,6 +248,23 @@ export async function GET(req: NextRequest) {
         })();
       }
       const slice = shuffle(entry.posts).slice(0, want);
+
+      // Upgrade any proxy video URLs to CDN if the video is now in S3.
+      // Runs in parallel — adds ~10ms but enables autoplay for uploaded videos.
+      // slice elements share object references with entry.posts, so mutating
+      // post.mediaUrl here also updates the cache for subsequent requests.
+      if (s3) {
+        const proxyVideos = slice.filter(p => p.hasVideo && p.mediaUrl?.startsWith("/api/"));
+        if (proxyVideos.length > 0) {
+          await Promise.all(proxyVideos.map(async (post) => {
+            try {
+              const key = mediaKey(channel, post.id);
+              if (await existsInS3(key)) post.mediaUrl = cdnUrl(key);
+            } catch { /* ignore — don't break cache serve on S3 error */ }
+          }));
+        }
+      }
+
       console.log(`[telegram/posts] cache hit @${channel} → ${slice.length} posts`);
       return NextResponse.json({ posts: slice, channel, cached: true });
     }
@@ -268,6 +285,17 @@ export async function GET(req: NextRequest) {
     if (entry) {
       const want = initial ? Math.min(limit, 10) : limit;
       const slice = shuffle(entry.posts).slice(0, want);
+      if (s3) {
+        const proxyVideos = slice.filter(p => p.hasVideo && p.mediaUrl?.startsWith("/api/"));
+        if (proxyVideos.length > 0) {
+          await Promise.all(proxyVideos.map(async (post) => {
+            try {
+              const key = mediaKey(channel, post.id);
+              if (await existsInS3(key)) post.mediaUrl = cdnUrl(key);
+            } catch { /* ignore */ }
+          }));
+        }
+      }
       return NextResponse.json({ posts: slice, channel, cached: true, stale: true });
     }
     return NextResponse.json({ error: String(err) }, { status: 500 });
