@@ -204,9 +204,9 @@ export default function Feed() {
       setFeedItems(facts.map((card) => ({ kind: "fact" as const, card, uid: card.id })));
       setFeedLoading(false);
 
-      // Phase 2 — inject Telegram posts interleaved with facts (1 post per 5 facts)
+      // Phase 2 — inject Telegram posts at 1:1 ratio with facts
       if (!category) {
-        fetchTelegramSequential(5, injectTelegramPost).catch(() => {});
+        fetchTelegramSequential(10, injectTelegramPost).catch(() => {});
       }
     } catch {
       setFeedError(true);
@@ -215,13 +215,13 @@ export default function Feed() {
   }
 
   // Splice a Telegram post into the feed at the correct interleaved position.
-  // Pattern: one post after every 5 facts → positions 5, 11, 17, 23, 29, …
+  // Pattern: 1 fact then 1 post → positions 1, 3, 5, 7, 9, …
   // If the user has already scrolled past the target slot, pick a random position
-  // in the tail of the feed. Hard cap: 10 Telegram posts per session.
+  // in the tail of the feed. Hard cap: 25 Telegram posts per session.
   function injectTelegramPost(item: FeedItem) {
-    if (tgInsertCountRef.current >= 10) return;
+    if (tgInsertCountRef.current >= 25) return;
     const n = tgInsertCountRef.current++;           // 0-indexed ordinal before insert
-    const targetIdx = 5 + n * 6;                   // ideal slot: after every 5 facts
+    const targetIdx = 1 + n * 2;                   // ideal slot: after every 1 fact
     setFeedItems((prev) => {
       if (prev.length === 0) return prev;
       let insertIdx: number;
@@ -256,7 +256,7 @@ export default function Feed() {
 
       // Phase 2 — continue interleaving Telegram posts (same counter, same cap)
       if (!activeCategory) {
-        fetchTelegramSequential(5, injectTelegramPost).catch(() => {});
+        fetchTelegramSequential(10, injectTelegramPost).catch(() => {});
       }
     } catch {
       // ignore
@@ -742,13 +742,14 @@ export default function Feed() {
                       <ExploreLoadingState />
                     ) : (
                       <>
-                        {exploreCards.map((card) => (
+                        {exploreCards.map((card, idx) => (
                           <InstaFactCard
                             key={card.id}
                             card={card}
                             isBookmarked={bookmarks.some((b) => b.id === card.id)}
                             onBookmark={() => toggleBookmark(card)}
                             onReadStory={STORY_CATEGORIES.has(card.category) ? () => setStoryCard(card) : undefined}
+                            imageVariant={idx}
                           />
                         ))}
                         <div ref={exploreSentinelRef} className="py-2 flex items-center justify-center">
@@ -1041,11 +1042,13 @@ function InstaFactCard({
   isBookmarked,
   onBookmark,
   onReadStory,
+  imageVariant = 0,
 }: {
   card: MythCard;
   isBookmarked: boolean;
   onBookmark: () => void;
   onReadStory?: () => void;
+  imageVariant?: number;
 }) {
   const [img, setImg]         = useState(card.imageUrl ?? "");
   const [modal, setModal]     = useState(false);
@@ -1061,7 +1064,7 @@ function InstaFactCard({
       ([entry]) => {
         if (!entry.isIntersecting) return;
         obs.disconnect();
-        fetchDeityImageUrl(card.deityName, card.category).then((url) => {
+        fetchDeityImageUrl(card.deityName, card.category, imageVariant).then((url) => {
           if (url) setImg(url);
         });
       },
@@ -1069,7 +1072,7 @@ function InstaFactCard({
     );
     obs.observe(cardRef.current);
     return () => obs.disconnect();
-  }, [card.deityName, card.category, img]);
+  }, [card.deityName, card.category, imageVariant, img]);
 
   return (
     <>

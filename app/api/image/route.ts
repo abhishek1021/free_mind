@@ -101,7 +101,7 @@ async function fetchFromWikipedia(topic: string, hint: string): Promise<string> 
 
 // ── Pexels ────────────────────────────────────────────────────────────────────
 
-async function fetchFromPexels(topic: string, category: string): Promise<string> {
+async function fetchFromPexels(topic: string, category: string, variant: number): Promise<string> {
   const key = process.env.PEXELS_API_KEY;
   if (!key) {
     console.warn("[image/pexels] PEXELS_API_KEY not set — skipping");
@@ -117,7 +117,7 @@ async function fetchFromPexels(topic: string, category: string): Promise<string>
   for (const q of queries) {
     try {
       const res = await fetch(
-        `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=5&orientation=landscape`,
+        `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=15&orientation=landscape`,
         { headers: { Authorization: key } }
       );
       if (!res.ok) {
@@ -127,8 +127,8 @@ async function fetchFromPexels(topic: string, category: string): Promise<string>
       const data = await res.json();
       const photos: { src: { large: string } }[] = data?.photos ?? [];
       if (photos.length > 0) {
-        const pick = photos[Math.floor(Math.random() * photos.length)];
-        console.log(`[image] Pexels hit: "${q}" → ${pick.src.large}`);
+        const pick = photos[variant % photos.length];
+        console.log(`[image] Pexels hit: "${q}" variant=${variant} → ${pick.src.large}`);
         return pick.src.large;
       }
       console.log(`[image/pexels] "${q}" → 0 results`);
@@ -144,12 +144,13 @@ async function fetchFromPexels(topic: string, category: string): Promise<string>
 export async function GET(req: NextRequest) {
   const topic    = (req.nextUrl.searchParams.get("topic")    ?? "").trim();
   const category = (req.nextUrl.searchParams.get("category") ?? "").trim();
+  const variant  = Math.max(0, parseInt(req.nextUrl.searchParams.get("variant") ?? "0", 10) || 0);
 
   if (!topic) {
     return NextResponse.json({ url: "" }, { status: 400 });
   }
 
-  const cacheKey = `${topic}::${category}`;
+  const cacheKey = `${topic}::${category}::${variant}`;
 
   // Only serve from server cache if we have a real URL — never serve stale empty results
   if (cache.has(cacheKey)) {
@@ -160,11 +161,11 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  console.log(`[image] lookup: "${topic}" / "${category}"`);
+  console.log(`[image] lookup: "${topic}" / "${category}" / variant=${variant}`);
 
   try {
     // 1. Pexels first — fast CDN, great for all topic types
-    let url = await fetchFromPexels(topic, category);
+    let url = await fetchFromPexels(topic, category, variant);
 
     // 2. Wikipedia fallback — for topics Pexels doesn't cover well
     if (!url) {

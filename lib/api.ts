@@ -336,13 +336,13 @@ const _imgCache = new Map<string, string>();
 // Fetch image URL via the server-side /api/image route.
 // The server maintains its own persistent cache and handles all Wikipedia
 // rate-limiting — the client never talks to Wikipedia directly.
-export async function fetchDeityImageUrl(topic: string, category = ""): Promise<string> {
-  const cacheKey = `${topic}::${category}`;
+export async function fetchDeityImageUrl(topic: string, category = "", variant = 0): Promise<string> {
+  const cacheKey = `${topic}::${category}::${variant}`;
   if (_imgCache.has(cacheKey)) return _imgCache.get(cacheKey)!;
 
   try {
     const res  = await fetch(
-      `/api/image?topic=${encodeURIComponent(topic)}&category=${encodeURIComponent(category)}`
+      `/api/image?topic=${encodeURIComponent(topic)}&category=${encodeURIComponent(category)}&variant=${variant}`
     );
     const data = await res.json();
     const url  = data.url ?? "";
