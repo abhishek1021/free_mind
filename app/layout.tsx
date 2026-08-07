@@ -27,7 +27,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${geist.variable} ${roboto.variable} h-full`}>
-      <body className="h-full bg-[#0B0B18] antialiased">
+      <body className={`${roboto.className} h-full bg-[#0B0B18] antialiased`}>
         {children}
         <script
           dangerouslySetInnerHTML={{

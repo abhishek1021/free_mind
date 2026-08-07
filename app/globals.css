@@ -9,6 +9,7 @@ html, body {
   margin: 0;
   padding: 0;
   overscroll-behavior: none;
+  font-family: var(--font-roboto), 'Roboto', sans-serif;
 }
 
 ::-webkit-scrollbar {
