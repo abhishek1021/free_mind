@@ -329,6 +329,17 @@ export async function fetchDbTopic(category: string, topic: string): Promise<Myt
   return _fetchDb({ category, topic });
 }
 
+// Keyword search across all DB categories (one shard each, filtered in-memory)
+export async function fetchSearch(query: string): Promise<MythCard[]> {
+  try {
+    const res  = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+    const data = await res.json();
+    return (data.facts ?? []) as MythCard[];
+  } catch {
+    return [];
+  }
+}
+
 // ── Client-side image cache (browser session) ─────────────────
 // Prevents re-fetching the same topic within the same page session.
 const _imgCache = new Map<string, string>();

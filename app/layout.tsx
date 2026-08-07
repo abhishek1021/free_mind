@@ -1,8 +1,9 @@
 import type { Metadata, Viewport } from "next";
-import { Geist } from "next/font/google";
+import { Geist, Roboto } from "next/font/google";
 import "./globals.css";
 
-const geist = Geist({ subsets: ["latin"], variable: "--font-geist" });
+const geist  = Geist({ subsets: ["latin"], variable: "--font-geist" });
+const roboto = Roboto({ subsets: ["latin"], weight: ["300", "400", "500", "700"], variable: "--font-roboto" });
 
 export const metadata: Metadata = {
   title: "Free Mind",
@@ -25,8 +26,8 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${geist.variable} h-full`}>
-      <body className="h-full bg-[#0f0f0f] antialiased">
+    <html lang="en" className={`${geist.variable} ${roboto.variable} h-full`}>
+      <body className="h-full bg-[#0B0B18] antialiased">
         {children}
         <script
           dangerouslySetInnerHTML={{

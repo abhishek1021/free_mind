@@ -99,6 +99,40 @@ export async function queryFactsByShard(
   }
 }
 
+// ── Keyword search: query one random shard per category, filter in-memory ────
+// Cost: identical to one mixed-feed load (18 parallel shard queries).
+// No scan, no new GSI needed — reuses CategoryShardIndex exclusively.
+// Topic matches are ranked above fact-text matches for relevance.
+
+const SEARCH_CATEGORIES = [
+  "Mythology", "Science", "History", "Life Hacks", "Psychology",
+  "World Facts", "Philosophy", "Space & Astronomy", "Ancient Civilizations",
+  "Health & Human Body", "Nature & Animals", "Technology & Innovations",
+  "Mathematics & Numbers", "Art & Culture", "Famous Scientists & Inventors",
+  "Economics & Business", "Food & Cuisine", "Language & Words",
+];
+
+export async function searchFacts(query: string): Promise<DbFact[]> {
+  const q = query.toLowerCase().trim();
+  if (q.length < 2) return [];
+
+  const shard = Math.floor(Math.random() * 10);
+  const perCat = await Promise.all(
+    SEARCH_CATEGORIES.map(cat => queryFactsByShard(cat, shard, 100))
+  );
+
+  const topicMatches: DbFact[] = [];
+  const factMatches:  DbFact[] = [];
+  for (const catFacts of perCat) {
+    for (const f of catFacts) {
+      if (f.topic.toLowerCase().includes(q))      topicMatches.push(f);
+      else if (f.fact.toLowerCase().includes(q))  factMatches.push(f);
+    }
+  }
+
+  return [...topicMatches, ...factMatches].slice(0, 30);
+}
+
 // ── Topic query: scan several random shards and filter by topic ───────────────
 // Used by the explore tab when the user picks a specific topic chip.
 // Tries up to `maxShards` random shards and stops once `needed` facts found.

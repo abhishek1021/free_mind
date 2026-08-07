@@ -14,6 +14,7 @@ import {
   fetchDbMixed,
   fetchDbCategory,
   fetchDbTopic,
+  fetchSearch,
 } from "@/lib/api";
 import { TELEGRAM_CHANNELS, TelegramChannel } from "@/lib/telegram-channels";
 import { TelegramPost } from "@/app/api/telegram/posts/route";
@@ -90,6 +91,33 @@ export default function Feed() {
 
   // ── Story reader ──────────────────────────────────────────────
   const [storyCard, setStoryCard] = useState<MythCard | null>(null);
+
+  // ── Search ────────────────────────────────────────────────────
+  const [showSearch, setShowSearch]         = useState(false);
+  const [searchQuery, setSearchQuery]       = useState("");
+  const [searchResults, setSearchResults]   = useState<MythCard[]>([]);
+  const [searchLoading, setSearchLoading]   = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function handleSearchInput(q: string) {
+    setSearchQuery(q);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    if (q.trim().length < 2) { setSearchResults([]); setSearchLoading(false); return; }
+    setSearchLoading(true);
+    searchTimerRef.current = setTimeout(async () => {
+      const results = await fetchSearch(q.trim());
+      setSearchResults(results);
+      setSearchLoading(false);
+    }, 400);
+  }
+
+  function closeSearch() {
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchLoading(false);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+  }
 
   // ── Bookmarks ─────────────────────────────────────────────────
   const [bookmarks, setBookmarks] = useState<MythCard[]>([]);
@@ -506,10 +534,68 @@ export default function Feed() {
   // ── Render ────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col h-full w-full" style={{ background: "#0f0f0f" }}>
+    <div className="flex flex-col h-full w-full" style={{ background: "#0B0B18" }}>
       {/* Story full-screen reader */}
       {storyCard && (
         <StoryReader card={storyCard} onClose={() => setStoryCard(null)} />
+      )}
+
+      {/* ── Search overlay ───────────────────────────────────────── */}
+      {showSearch && (
+        <div className="absolute inset-0 z-50 flex flex-col" style={{ background: "#0B0B18", fontFamily: "var(--font-roboto), sans-serif" }}>
+          <div className="flex items-center gap-3 px-4 pt-5 pb-3 flex-shrink-0" style={{ borderBottom: "0.5px solid rgba(255,255,255,0.08)" }}>
+            <button onClick={closeSearch} className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: "rgba(255,255,255,0.07)" }} aria-label="Close search">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="rgba(255,255,255,0.7)" strokeWidth="2.5" strokeLinecap="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+            </button>
+            <input
+              type="search"
+              autoFocus
+              placeholder="Search facts, topics…"
+              value={searchQuery}
+              onChange={(e) => handleSearchInput(e.target.value)}
+              className="flex-1 bg-transparent text-sm outline-none"
+              style={{ color: "#fff", fontFamily: "var(--font-roboto), sans-serif" }}
+            />
+            {searchQuery && (
+              <button onClick={() => { setSearchQuery(""); setSearchResults([]); }} aria-label="Clear" style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="rgba(255,255,255,0.4)" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-4 py-4" style={{ scrollbarWidth: "none" }}>
+            {searchLoading ? (
+              <div className="flex items-center justify-center h-32 gap-3">
+                <div className="w-4 h-4 rounded-full border-2 animate-spin" style={{ borderColor: "#6C47FF", borderTopColor: "transparent" }} />
+                <span className="text-sm" style={{ color: "rgba(255,255,255,0.4)", fontFamily: "var(--font-roboto), sans-serif" }}>Searching…</span>
+              </div>
+            ) : searchQuery.trim().length < 2 ? (
+              <div className="flex flex-col items-center justify-center h-40 gap-2">
+                <span className="text-3xl">🔍</span>
+                <p className="text-sm text-center" style={{ color: "rgba(255,255,255,0.35)", fontFamily: "var(--font-roboto), sans-serif" }}>Type at least 2 characters</p>
+              </div>
+            ) : searchResults.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-40 gap-2">
+                <span className="text-3xl">✦</span>
+                <p className="text-sm text-center" style={{ color: "rgba(255,255,255,0.35)", fontFamily: "var(--font-roboto), sans-serif" }}>No results for &ldquo;{searchQuery}&rdquo;</p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <p className="text-xs" style={{ color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-roboto), sans-serif" }}>{searchResults.length} results for &ldquo;{searchQuery}&rdquo;</p>
+                {searchResults.map((card, idx) => (
+                  <InstaFactCard
+                    key={card.id}
+                    card={card}
+                    isBookmarked={bookmarks.some((b) => b.id === card.id)}
+                    onBookmark={() => toggleBookmark(card)}
+                    onReadStory={STORY_CATEGORIES.has(card.category) ? () => setStoryCard(card) : undefined}
+                    imageVariant={idx}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       )}
 
       <div className="flex-1 min-h-0">
@@ -519,21 +605,35 @@ export default function Feed() {
           <div className="h-full flex flex-col">
 
             {/* Header + category chips */}
-            <div className="px-4 pt-4 pb-2 flex-shrink-0">
-              <div className="flex items-center justify-between mb-3">
-                <h1 className="text-white font-semibold text-base tracking-tight">Free Mind</h1>
-                <button
-                  onClick={() => { setActiveCategory(null); loadInitialFeed(null); }}
-                  className="w-9 h-9 rounded-full flex items-center justify-center"
-                  style={{ background: "rgba(255,255,255,0.07)", color: "rgba(255,255,255,0.5)" }}
-                  aria-label="Refresh feed"
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="16 3 21 3 21 8"/><polyline points="4 20 9 20 9 15"/>
-                    <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
-                    <polyline points="16 21 21 21 21 16"/><polyline points="4 4 9 4 9 9"/>
-                  </svg>
-                </button>
+            <div className="px-4 pt-5 pb-2 flex-shrink-0">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <span style={{ fontSize: 22 }}>🧠</span>
+                  <h1 style={{ fontFamily: "var(--font-roboto), sans-serif", fontWeight: 700, fontSize: 18, color: "#fff", letterSpacing: "-0.3px" }}>Free Mind</h1>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setShowSearch(true)}
+                    className="w-9 h-9 rounded-xl flex items-center justify-center"
+                    style={{ background: "rgba(255,255,255,0.07)" }}
+                    aria-label="Search"
+                  >
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="rgba(255,255,255,0.6)" strokeWidth="2.3" strokeLinecap="round">
+                      <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => { setActiveCategory(null); loadInitialFeed(null); }}
+                    className="w-9 h-9 rounded-xl flex items-center justify-center"
+                    style={{ background: "rgba(255,255,255,0.07)" }}
+                    aria-label="Refresh feed"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="rgba(255,255,255,0.6)" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 12a9 9 0 11-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+                      <polyline points="21 3 21 8 16 8" />
+                    </svg>
+                  </button>
+                </div>
               </div>
               <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: "none" }}>
                 {Object.entries(CONTENT_CATEGORIES).map(([cat, meta]) => (
@@ -543,8 +643,8 @@ export default function Feed() {
                     className="px-3.5 py-1.5 rounded-full text-xs whitespace-nowrap flex-shrink-0 transition-all"
                     style={
                       activeCategory === cat
-                        ? { background: meta.color, color: "#fff" }
-                        : { background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.45)" }
+                        ? { background: meta.color, color: "#fff", fontFamily: "var(--font-roboto), sans-serif", fontWeight: 600 }
+                        : { background: `${meta.color}18`, border: `1px solid ${meta.color}35`, color: meta.color, fontFamily: "var(--font-roboto), sans-serif", fontWeight: 500 }
                     }
                   >
                     {meta.emoji} {cat}
@@ -901,7 +1001,7 @@ export default function Feed() {
       </div>
 
       {/* Bottom tab bar */}
-      <nav className="flex flex-shrink-0" style={{ borderTop: "1px solid rgba(255,255,255,0.07)", background: "#0f0f0f" }}>
+      <nav className="flex flex-shrink-0" style={{ borderTop: "0.5px solid rgba(255,255,255,0.07)", background: "#0F0F1E" }}>
         {([
           { id: "feed" as Tab, Icon: LayoutGrid, label: "Feed" },
           { id: "explore" as Tab, Icon: Compass, label: "Explore" },
@@ -911,11 +1011,20 @@ export default function Feed() {
           <button
             key={id}
             onClick={() => setTab(id)}
-            className="flex-1 py-3.5 flex flex-col items-center gap-1 text-xs transition-colors"
-            style={{ color: tab === id ? "#818cf8" : "rgba(255,255,255,0.22)" }}
+            className="flex-1 py-3 flex flex-col items-center gap-1 transition-colors"
+            style={{ color: tab === id ? "#A78BFA" : "rgba(255,255,255,0.28)", fontFamily: "var(--font-roboto), sans-serif" }}
           >
-            <Icon size={19} />
-            <span>{label}</span>
+            <div
+              className="flex items-center justify-center rounded-xl"
+              style={{
+                width: 44, height: 28,
+                background: tab === id ? "rgba(108,71,255,0.18)" : "transparent",
+                transition: "background 0.2s ease",
+              }}
+            >
+              <Icon size={18} />
+            </div>
+            <span style={{ fontSize: 10, fontWeight: tab === id ? 600 : 400 }}>{label}</span>
           </button>
         ))}
       </nav>
@@ -1081,12 +1190,17 @@ function InstaFactCard({
       <div
         ref={cardRef}
         className="rounded-2xl overflow-hidden select-none"
-        style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" }}
+        style={{
+          background: "#13131F",
+          border: "1px solid rgba(255,255,255,0.09)",
+          boxShadow: "0 8px 24px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.4)",
+          fontFamily: "var(--font-roboto), sans-serif",
+        }}
         {...longPress}
       >
-        {/* Image — object-contain so full image is visible */}
+        {/* Image */}
         {img ? (
-          <div style={{ background: "#000", width: "100%" }}>
+          <div style={{ background: "#09090F", width: "100%" }}>
             <img
               src={img}
               alt={card.deityName}
@@ -1102,7 +1216,7 @@ function InstaFactCard({
         {/* Content */}
         <div className="p-4">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium px-2.5 py-1 rounded-full" style={{ background: `${meta.color}22`, color: meta.color }}>
+            <span className="text-xs px-2.5 py-1 rounded-full" style={{ background: `${meta.color}25`, color: meta.color, fontWeight: 600 }}>
               {meta.emoji} {card.category}
             </span>
             <button
@@ -1115,16 +1229,16 @@ function InstaFactCard({
               <Bookmark size={15} fill={isBookmarked ? "white" : "none"} />
             </button>
           </div>
-          <p className="text-xs font-medium mb-2" style={{ color: "rgba(255,255,255,0.4)" }}>{card.deityName}</p>
-          <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.82)" }}>{card.fact}</p>
+          <p className="text-xs mb-2" style={{ color: "rgba(255,255,255,0.38)", fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.6px" }}>{card.deityName}</p>
+          <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.85)", fontWeight: 400 }}>{card.fact}</p>
 
           {/* Read full story button — story categories only */}
           {onReadStory && (
             <button
               onClick={onReadStory}
               onPointerDown={(e) => e.stopPropagation()}
-              className="mt-3 flex items-center gap-2 text-sm font-medium rounded-xl px-4 py-2.5 w-full justify-center transition-opacity active:opacity-70"
-              style={{ background: `${meta.color}22`, color: meta.color, border: `1px solid ${meta.color}40` }}
+              className="mt-3 flex items-center gap-2 text-sm rounded-xl px-4 py-2.5 w-full justify-center transition-opacity active:opacity-70"
+              style={{ background: `${meta.color}22`, color: meta.color, border: `1px solid ${meta.color}40`, fontWeight: 500 }}
             >
               <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
                 <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
@@ -1133,10 +1247,10 @@ function InstaFactCard({
             </button>
           )}
 
-          {/* Long-press hint */}
-          <p className="text-center mt-3 text-xs" style={{ color: "rgba(255,255,255,0.15)" }}>
-            Hold to expand
-          </p>
+          {/* Footer */}
+          <div className="flex items-center justify-between mt-3">
+            <p className="text-xs italic" style={{ color: "rgba(255,255,255,0.13)" }}>Hold to expand</p>
+          </div>
         </div>
       </div>
     </>
@@ -1400,7 +1514,12 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
       )}
       <div
         className="relative rounded-2xl overflow-hidden select-none"
-        style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(36,129,204,0.35)" }}
+        style={{
+          background: "#0D1929",
+          border: "1px solid rgba(36,129,204,0.30)",
+          boxShadow: "0 8px 24px rgba(0,0,0,0.55), 0 0 0 0.5px rgba(36,129,204,0.12)",
+          fontFamily: "var(--font-roboto), sans-serif",
+        }}
         {...longPress}
       >
         {/* Telegram source badge */}
@@ -1531,24 +1650,22 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
         )}
 
         <div className="p-4">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-xs font-medium px-2.5 py-0.5 rounded-full" style={{ background: "rgba(36,129,204,0.2)", color: "#2481cc" }}>
-              {channel.emoji} {channel.name}
-            </span>
-            <span className="text-xs" style={{ color: "rgba(255,255,255,0.25)" }}>{date}</span>
+          <div className="flex items-center gap-2 mb-2.5">
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#2481cc", display: "inline-block", flexShrink: 0 }} />
+            <span className="text-xs" style={{ color: "#2481cc", fontWeight: 600 }}>{channel.emoji} {channel.name}</span>
+            <span className="text-xs" style={{ color: "rgba(255,255,255,0.22)" }}>{date}</span>
+          </div>
+          <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.82)", fontWeight: 400 }}>
+            {post.text.length > 300 ? post.text.slice(0, 300) + "…" : post.text}
+          </p>
+          <div className="flex items-center justify-between mt-3">
+            <p className="text-xs italic" style={{ color: "rgba(255,255,255,0.13)" }}>Hold to expand</p>
             {post.views > 0 && (
-              <span className="text-xs ml-auto" style={{ color: "rgba(255,255,255,0.2)" }}>
+              <span className="text-xs" style={{ color: "rgba(255,255,255,0.22)" }}>
                 👁 {post.views.toLocaleString()}
               </span>
             )}
           </div>
-          <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.75)" }}>
-            {post.text.length > 300 ? post.text.slice(0, 300) + "…" : post.text}
-          </p>
-          {/* Long-press hint */}
-          <p className="text-center mt-3 text-xs" style={{ color: "rgba(255,255,255,0.15)" }}>
-            Hold to expand
-          </p>
         </div>
       </div>
     </>
