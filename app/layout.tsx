@@ -31,7 +31,18 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {children}
         <script
           dangerouslySetInnerHTML={{
-            __html: `if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');`,
+            __html: `
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js');
+  // When the SW posts SW_UPDATED (new build activated), reload so the
+  // fresh HTML + content-hashed CSS/JS/fonts are fetched immediately.
+  navigator.serviceWorker.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'SW_UPDATED') {
+      window.location.reload();
+    }
+  });
+}
+`,
           }}
         />
       </body>
