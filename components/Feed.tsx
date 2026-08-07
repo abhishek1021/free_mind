@@ -6,11 +6,14 @@ import {
   MythCard,
   fetchGeminiCards,
   fetchMixedBatch,
-  fetchRandomGeminiCards,
   fetchCategoryMixedBatch,
   fetchDeityImageUrl,
   randomDeity,
   CONTENT_CATEGORIES,
+  isDbCategory,
+  fetchDbMixed,
+  fetchDbCategory,
+  fetchDbTopic,
 } from "@/lib/api";
 import { TELEGRAM_CHANNELS, TelegramChannel } from "@/lib/telegram-channels";
 import { TelegramPost } from "@/app/api/telegram/posts/route";
@@ -38,6 +41,13 @@ export default function Feed() {
   const feedScrollRef      = useRef<HTMLDivElement>(null);
   const seenPostIds        = useRef(new Set<string>());
   const channelPool        = useRef<TelegramChannel[]>([]);
+  // Session dedup: tracks factIds shown so far — prevents repeats within a session
+  const seenFactIds        = useRef(new Set<string>());
+  // Shard cursors: rotate 0-9 across loads for variety without repeating same facts
+  const feedShardRef       = useRef(Math.floor(Math.random() * 10));
+  const exploreShardRef    = useRef<Record<string, number>>({});
+  // How many Telegram posts have been injected this session (resets on fresh load)
+  const tgInsertCountRef   = useRef(0);
 
   // ── Pull-to-refresh state ─────────────────────────────────────
   const [pullDistance, setPullDistance]   = useState(0);
@@ -53,7 +63,12 @@ export default function Feed() {
   const [exploreCards, setExploreCards]             = useState<MythCard[]>([]);
   const [exploreLoading, setExploreLoading]         = useState(false);
   const [exploreLoadingMore, setExploreLoadingMore] = useState(false);
-  const exploreLoadingMoreRef = useRef(false);
+  // Which accordion row is open (null = all collapsed)
+  const [openAccordion, setOpenAccordion]           = useState<string | null>(null);
+  const exploreLoadingMoreRef    = useRef(false);
+  // Mirrors exploreLoading as a ref so IntersectionObserver callbacks (which
+  // capture stale closures) can reliably block loadMoreExplore during initial load.
+  const exploreInitialLoadingRef = useRef(false);
   const exploreSentinelRef    = useRef<HTMLDivElement>(null);
 
   // ── Channels state ───────────────────────────────────────────
@@ -116,9 +131,7 @@ export default function Feed() {
 
     for (const ch of picks) {
       try {
-        // Pick a random point in the channel's recent history so each refresh
-        // surfaces different posts. 40% chance to get the very latest (no offset);
-        // otherwise pick a random date between 1 and 60 days ago.
+        // 40% chance to get the very latest; otherwise pick a random date 1-60 days back
         const useOffset = Math.random() > 0.4;
         const offsetDate = useOffset
           ? Math.floor(Date.now() / 1000) - (1 + Math.floor(Math.random() * 59)) * 86400
@@ -126,17 +139,52 @@ export default function Feed() {
 
         const url = `/api/telegram/posts?channel=${encodeURIComponent(ch.username)}&limit=5${offsetDate ? `&offsetDate=${offsetDate}` : ""}`;
         const res  = await fetch(url);
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.warn(`[telegram] @${ch.username} → HTTP ${res.status}:`, errData?.error ?? "unknown");
+          continue;
+        }
         const data = await res.json();
         const posts: TelegramPost[] = data.posts ?? [];
+        if (posts.length === 0) {
+          console.warn(`[telegram] @${ch.username} returned 0 posts (cached=${data.cached})`);
+          continue;
+        }
         const fresh = posts.filter((p) => !seenPostIds.current.has(`${ch.username}-${p.id}`));
         if (fresh.length === 0) continue;
         const post = fresh[0];
         seenPostIds.current.add(`${ch.username}-${post.id}`);
         onItem({ kind: "post", post, channel: ch, uid: `${ch.username}-${post.id}` });
-      } catch {
-        // skip this channel, continue to the next
+      } catch (err) {
+        console.warn(`[telegram] @${ch.username} fetch failed:`, err);
       }
     }
+  }
+
+  // Fetch a batch of fact cards — DB for seeded categories, Gemini for stories/riddles.
+  // `shard` rotates 0-9 across calls for variety. Session dedup applied client-side.
+  // `cap` limits how many facts are returned (used on initial load so Telegram posts
+  // appear early in the feed rather than after 160+ facts).
+  async function fetchFeedBatch(category: string | null, shard: number, cap = Infinity): Promise<MythCard[]> {
+    let raw: MythCard[] = [];
+
+    if (!category) {
+      // Mixed feed — try DB (all non-story categories), fall back to Gemini
+      raw = await fetchDbMixed(shard).catch(() => []);
+      if (raw.length === 0) raw = await fetchMixedBatch(6).catch(() => []);
+    } else if (isDbCategory(category)) {
+      // DB category chip selected
+      raw = await fetchDbCategory(category, shard).catch(() => []);
+      if (raw.length === 0) raw = await fetchCategoryMixedBatch(category).catch(() => []);
+    } else {
+      // Story / Riddles — always Gemini
+      raw = await fetchCategoryMixedBatch(category).catch(() => []);
+    }
+
+    // Filter out facts already shown this session, register new ones, apply cap
+    const unseen = raw.filter(c => !seenFactIds.current.has(c.id)).slice(0, cap);
+    unseen.forEach(c => seenFactIds.current.add(c.id));
+    return unseen;
   }
 
   async function loadInitialFeed(category: string | null) {
@@ -144,22 +192,21 @@ export default function Feed() {
     setFeedError(false);
     setFeedItems([]);
     seenPostIds.current.clear();
+    seenFactIds.current.clear();
     channelPool.current = [];
-
-    const factsPromise = category ? fetchCategoryMixedBatch(category) : fetchMixedBatch(6);
+    tgInsertCountRef.current = 0;
+    // Fresh shard on each initial load for variety
+    feedShardRef.current = Math.floor(Math.random() * 10);
 
     try {
-      // Phase 1 — show facts immediately, dismiss loading spinner
-      const facts = await factsPromise;
+      // Phase 1 — cap at 20 facts so Telegram posts inject visibly near the top
+      const facts = await fetchFeedBatch(category, feedShardRef.current, 20);
       setFeedItems(facts.map((card) => ({ kind: "fact" as const, card, uid: card.id })));
       setFeedLoading(false);
 
-      // Phase 2 — fetch Telegram posts one channel at a time; each post appends
-      // to the feed as soon as it arrives (no waiting for all channels to finish)
+      // Phase 2 — inject Telegram posts interleaved with facts (1 post per 5 facts)
       if (!category) {
-        fetchTelegramSequential(4, (item) => {
-          setFeedItems((prev) => [...prev, item]);
-        }).catch(() => {});
+        fetchTelegramSequential(5, injectTelegramPost).catch(() => {});
       }
     } catch {
       setFeedError(true);
@@ -167,25 +214,49 @@ export default function Feed() {
     }
   }
 
+  // Splice a Telegram post into the feed at the correct interleaved position.
+  // Pattern: one post after every 5 facts → positions 5, 11, 17, 23, 29, …
+  // If the user has already scrolled past the target slot, pick a random position
+  // in the tail of the feed. Hard cap: 10 Telegram posts per session.
+  function injectTelegramPost(item: FeedItem) {
+    if (tgInsertCountRef.current >= 10) return;
+    const n = tgInsertCountRef.current++;           // 0-indexed ordinal before insert
+    const targetIdx = 5 + n * 6;                   // ideal slot: after every 5 facts
+    setFeedItems((prev) => {
+      if (prev.length === 0) return prev;
+      let insertIdx: number;
+      if (prev.length <= targetIdx) {
+        // Feed is still shorter than the target slot — append at end
+        insertIdx = prev.length;
+      } else {
+        // User has scrolled past the ideal slot — pick a random position in the tail
+        const tail = prev.length - targetIdx;
+        insertIdx = targetIdx + Math.floor(Math.random() * tail);
+      }
+      const next = [...prev];
+      next.splice(insertIdx, 0, item);
+      return next;
+    });
+  }
+
   async function loadMoreFeed() {
     if (feedLoadingMoreRef.current) return;
     feedLoadingMoreRef.current = true;
     setFeedLoadingMore(true);
 
-    const factsPromise = activeCategory ? fetchCategoryMixedBatch(activeCategory) : fetchMixedBatch(6);
+    // Rotate to next shard so we surface different facts on each load-more
+    feedShardRef.current = (feedShardRef.current + 1) % 10;
 
     try {
       // Phase 1 — append facts and dismiss the loading spinner
-      const facts = await factsPromise;
+      const facts = await fetchFeedBatch(activeCategory, feedShardRef.current);
       setFeedItems((prev) => [...prev, ...facts.map((card) => ({ kind: "fact" as const, card, uid: card.id }))]);
       setFeedLoadingMore(false);
       feedLoadingMoreRef.current = false;
 
-      // Phase 2 — append Telegram posts one at a time after facts are shown
+      // Phase 2 — continue interleaving Telegram posts (same counter, same cap)
       if (!activeCategory) {
-        fetchTelegramSequential(4, (item) => {
-          setFeedItems((prev) => [...prev, item]);
-        }).catch(() => {});
+        fetchTelegramSequential(5, injectTelegramPost).catch(() => {});
       }
     } catch {
       // ignore
@@ -246,32 +317,99 @@ export default function Feed() {
   // ── Explore actions ───────────────────────────────────────────
 
   async function loadExploreCategory(cat: string) {
+    exploreInitialLoadingRef.current = true;
     setExploreCategory(cat);
-    const topic = randomDeity(cat);
-    setExploreTopic(topic);
-    setExploreLoading(true);
     setExploreCards([]);
-    try { setExploreCards(await fetchGeminiCards(topic, cat, 10)); } catch {}
-    finally { setExploreLoading(false); }
+    setExploreLoading(true);
+    // Reset explore shard cursor for this category
+    exploreShardRef.current[cat] = Math.floor(Math.random() * 10);
+
+    try {
+      let cards: MythCard[] = [];
+      if (isDbCategory(cat)) {
+        // DB: fetch category-level facts for a random shard, no topic filter
+        cards = await fetchDbCategory(cat, exploreShardRef.current[cat]).catch(() => []);
+      }
+      // Fall back to Gemini if DB empty or story/riddle category
+      if (cards.length === 0) {
+        const topic = randomDeity(cat);
+        setExploreTopic(topic);
+        cards = await fetchGeminiCards(topic, cat, 10).catch(() => []);
+      } else {
+        setExploreTopic(null);
+      }
+      setExploreCards(cards);
+    } catch {}
+    finally {
+      exploreInitialLoadingRef.current = false;
+      setExploreLoading(false);
+    }
   }
 
   async function loadExploreTopic(topic: string, cat: string) {
+    exploreInitialLoadingRef.current = true;
+    setExploreCategory(cat);
     setExploreTopic(topic);
     setExploreLoading(true);
     setExploreCards([]);
-    try { setExploreCards(await fetchGeminiCards(topic, cat, 10)); } catch {}
-    finally { setExploreLoading(false); }
+
+    try {
+      let cards: MythCard[] = [];
+      if (isDbCategory(cat)) {
+        // Try topic-specific DB query first
+        cards = await fetchDbTopic(cat, topic).catch(() => []);
+      }
+      // Fall back to Gemini if topic not in DB or story/riddle
+      if (cards.length === 0) {
+        cards = await fetchGeminiCards(topic, cat, 10).catch(() => []);
+      }
+      setExploreCards(cards);
+    } catch {}
+    finally {
+      exploreInitialLoadingRef.current = false;
+      setExploreLoading(false);
+    }
   }
 
   async function loadMoreExplore() {
-    if (!exploreCategory || exploreLoadingMoreRef.current) return;
+    // Block if initial load is in flight — IntersectionObserver can fire immediately
+    // when exploreCards is empty (sentinel visible), racing with loadExploreTopic
+    // and overwriting its setExploreCards result with an empty append.
+    if (!exploreCategory || exploreLoadingMoreRef.current || exploreInitialLoadingRef.current) return;
     exploreLoadingMoreRef.current = true;
     setExploreLoadingMore(true);
+
+    const shown = new Set(exploreCards.map((c) => c.id));
+
     try {
-      const topics  = CONTENT_CATEGORIES[exploreCategory]?.topics ?? [];
-      const fresh   = topics.filter((t) => t !== exploreTopic);
-      const next    = fresh.length > 0 ? fresh[Math.floor(Math.random() * fresh.length)] : randomDeity(exploreCategory);
-      const more = await fetchGeminiCards(next, exploreCategory, 10);
+      let more: MythCard[] = [];
+
+      if (exploreTopic) {
+        // ── Topic-specific load-more ─────────────────────────────
+        // Stay on the same topic — try DB first, Gemini as fallback
+        if (isDbCategory(exploreCategory)) {
+          more = await fetchDbTopic(exploreCategory, exploreTopic).catch(() => []);
+          more = more.filter((c) => !shown.has(c.id));
+        }
+        if (more.length === 0) {
+          // Gemini fallback — same topic, not a random one
+          more = await fetchGeminiCards(exploreTopic, exploreCategory, 10).catch(() => []);
+          more = more.filter((c) => !shown.has(c.id));
+        }
+      } else {
+        // ── Category-level load-more (no topic selected) ─────────
+        const prev = exploreShardRef.current[exploreCategory] ?? 0;
+        exploreShardRef.current[exploreCategory] = (prev + 1) % 10;
+        if (isDbCategory(exploreCategory)) {
+          more = await fetchDbCategory(exploreCategory, exploreShardRef.current[exploreCategory]).catch(() => []);
+          more = more.filter((c) => !shown.has(c.id));
+        }
+        if (more.length === 0) {
+          more = await fetchCategoryMixedBatch(exploreCategory).catch(() => []);
+          more = more.filter((c) => !shown.has(c.id));
+        }
+      }
+
       setExploreCards((prev) => [...prev, ...more]);
     } catch {}
     finally { setExploreLoadingMore(false); exploreLoadingMoreRef.current = false; }
@@ -502,75 +640,132 @@ export default function Feed() {
         {/* ── EXPLORE TAB ───────────────────────────────────────── */}
         {tab === "explore" && (
           <div className="h-full flex flex-col">
-            <div className="px-4 pt-4 flex-shrink-0">
-              <h2 className="text-white font-semibold text-base mb-3">Explore</h2>
-              <div className="flex flex-wrap gap-2 pb-3">
-                {Object.entries(CONTENT_CATEGORIES).map(([cat, meta]) => (
+
+            {/* Header — switches between accordion title and cards breadcrumb */}
+            <div
+              className="px-4 pt-4 pb-3 flex-shrink-0"
+              style={{ borderBottom: "1px solid rgba(255,255,255,0.06)" }}
+            >
+              {exploreCategory ? (
+                <div className="flex items-center gap-3">
                   <button
-                    key={cat}
-                    onClick={() => loadExploreCategory(cat)}
-                    className="px-3.5 py-2 rounded-full text-xs transition-all font-medium"
-                    style={
-                      exploreCategory === cat
-                        ? { background: meta.color, color: "#fff" }
-                        : { background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.5)" }
-                    }
+                    onClick={() => {
+                      setOpenAccordion(exploreCategory);
+                      setExploreCategory(null);
+                      setExploreTopic(null);
+                      setExploreCards([]);
+                    }}
+                    className="flex items-center justify-center rounded-full flex-shrink-0"
+                    style={{ width: 32, height: 32, background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.7)" }}
+                    aria-label="Back to categories"
                   >
-                    {meta.emoji} {cat}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="15 18 9 12 15 6" />
+                    </svg>
                   </button>
-                ))}
-              </div>
-              {exploreCategory && !exploreLoading && (
-                <>
-                  <p className="text-xs mb-2" style={{ color: "rgba(255,255,255,0.25)" }}>Topics in {exploreCategory}</p>
-                  <div className="flex flex-wrap gap-2 pb-3">
-                    {CONTENT_CATEGORIES[exploreCategory].topics.map((topic) => (
-                      <button
-                        key={topic}
-                        onClick={() => loadExploreTopic(topic, exploreCategory)}
-                        className="px-3 py-1.5 rounded-full text-xs transition-all"
-                        style={
-                          exploreTopic === topic
-                            ? { background: `${CONTENT_CATEGORIES[exploreCategory].color}33`, border: `1px solid ${CONTENT_CATEGORIES[exploreCategory].color}`, color: CONTENT_CATEGORIES[exploreCategory].color }
-                            : { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", color: "rgba(255,255,255,0.35)" }
-                        }
-                      >
-                        {topic}
-                      </button>
-                    ))}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs" style={{ color: "rgba(255,255,255,0.3)" }}>
+                      {CONTENT_CATEGORIES[exploreCategory]?.emoji} {exploreCategory}
+                    </p>
+                    <h2 className="text-white font-semibold text-sm truncate">
+                      {exploreTopic ?? "All Topics"}
+                    </h2>
                   </div>
-                </>
+                </div>
+              ) : (
+                <h2 className="text-white font-semibold text-base">Explore</h2>
               )}
             </div>
-            <div className="flex-1 overflow-y-auto px-4 pb-6">
-              {!exploreCategory ? (
-                <div className="flex flex-col items-center justify-center h-64 text-center gap-3 px-6">
-                  <span className="text-4xl">✦</span>
-                  <p className="text-sm font-medium text-white">Pick a category above</p>
-                  <p className="text-xs leading-relaxed" style={{ color: "rgba(255,255,255,0.3)" }}>Choose Science, History, Riddles, or any category to start reading</p>
-                </div>
-              ) : exploreLoading ? (
-                <ExploreLoadingState />
-              ) : (
-                <div className="flex flex-col gap-3">
-                  {exploreCards.map((card) => (
-                    <ExploreFactCard
-                      key={card.id}
-                      card={card}
-                      onReadStory={STORY_CATEGORIES.has(card.category) ? () => setStoryCard(card) : undefined}
+
+            {/* Scrollable body */}
+            <div className="flex-1 overflow-y-auto pb-6">
+
+              {/* ── Accordion view (no category selected) ── */}
+              {!exploreCategory && (
+                <div className="px-4 pt-3 flex flex-col gap-2">
+                  {Object.entries(CONTENT_CATEGORIES).map(([cat, meta]) => (
+                    <AccordionCategory
+                      key={cat}
+                      cat={cat}
+                      meta={meta}
+                      isOpen={openAccordion === cat}
+                      onToggle={() => setOpenAccordion((v) => (v === cat ? null : cat))}
+                      onBrowseAll={() => loadExploreCategory(cat)}
+                      onTopicClick={(topic) => loadExploreTopic(topic, cat)}
                     />
                   ))}
-                  <div ref={exploreSentinelRef} className="py-2 flex items-center justify-center">
-                    {exploreLoadingMore && (
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 rounded-full border-2 animate-spin"
-                          style={{ borderColor: exploreCategory ? CONTENT_CATEGORIES[exploreCategory]?.color : "#4f46e5", borderTopColor: "transparent" }} />
-                        <span className="text-xs" style={{ color: "rgba(255,255,255,0.25)" }}>Loading more…</span>
-                      </div>
+                  {/* Bottom breathing room */}
+                  <div style={{ height: 8 }} />
+                </div>
+              )}
+
+              {/* ── Cards view (category selected) ── */}
+              {exploreCategory && (
+                <div className="flex flex-col">
+                  {/* Horizontal topic chip strip */}
+                  {!exploreLoading && CONTENT_CATEGORIES[exploreCategory] && (
+                    <div
+                      className="flex gap-2 px-4 pt-3 pb-2 overflow-x-auto flex-shrink-0"
+                      style={{ scrollbarWidth: "none" }}
+                    >
+                      <button
+                        onClick={() => loadExploreCategory(exploreCategory)}
+                        className="px-3.5 py-1.5 rounded-full text-xs whitespace-nowrap flex-shrink-0 font-medium transition-all"
+                        style={
+                          !exploreTopic
+                            ? { background: CONTENT_CATEGORIES[exploreCategory].color, color: "#fff" }
+                            : { background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.45)" }
+                        }
+                      >
+                        All
+                      </button>
+                      {CONTENT_CATEGORIES[exploreCategory].topics.map((topic) => (
+                        <button
+                          key={topic}
+                          onClick={() => loadExploreTopic(topic, exploreCategory)}
+                          className="px-3 py-1.5 rounded-full text-xs whitespace-nowrap flex-shrink-0 transition-all"
+                          style={
+                            exploreTopic === topic
+                              ? { background: `${CONTENT_CATEGORIES[exploreCategory].color}33`, border: `1px solid ${CONTENT_CATEGORIES[exploreCategory].color}`, color: CONTENT_CATEGORIES[exploreCategory].color }
+                              : { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", color: "rgba(255,255,255,0.35)" }
+                          }
+                        >
+                          {topic}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Cards */}
+                  <div className="px-4 pt-1 pb-6 flex flex-col gap-3">
+                    {exploreLoading ? (
+                      <ExploreLoadingState />
+                    ) : (
+                      <>
+                        {exploreCards.map((card) => (
+                          <ExploreFactCard
+                            key={card.id}
+                            card={card}
+                            onReadStory={STORY_CATEGORIES.has(card.category) ? () => setStoryCard(card) : undefined}
+                          />
+                        ))}
+                        <div ref={exploreSentinelRef} className="py-2 flex items-center justify-center">
+                          {exploreLoadingMore && (
+                            <div className="flex items-center gap-2">
+                              <div
+                                className="w-4 h-4 rounded-full border-2 animate-spin"
+                                style={{ borderColor: CONTENT_CATEGORIES[exploreCategory]?.color ?? "#4f46e5", borderTopColor: "transparent" }}
+                              />
+                              <span className="text-xs" style={{ color: "rgba(255,255,255,0.25)" }}>Loading more…</span>
+                            </div>
+                          )}
+                        </div>
+                      </>
                     )}
                   </div>
                 </div>
               )}
+
             </div>
           </div>
         )}
@@ -1293,28 +1488,163 @@ function ExploreFactCard({ card, onReadStory }: { card: MythCard; onReadStory?: 
   const meta = CONTENT_CATEGORIES[card.category] ?? CONTENT_CATEGORIES["Mythology"];
   return (
     <div
-      className="w-full text-left rounded-2xl p-4"
+      className="w-full text-left rounded-2xl overflow-hidden"
       style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" }}
     >
-      <div className="flex items-center gap-2 mb-2">
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-medium" style={{ background: `${meta.color}22`, color: meta.color }}>
-          {meta.emoji} {card.category}
-        </span>
-        <span className="text-xs truncate" style={{ color: "rgba(255,255,255,0.3)" }}>{card.deityName}</span>
+      {/* Colored top accent bar */}
+      <div style={{ height: 3, background: `linear-gradient(90deg, ${meta.color}, ${meta.color}55)` }} />
+
+      <div className="p-4">
+        {/* Topic badge */}
+        <div className="flex items-center gap-2 mb-2.5">
+          <span
+            className="text-xs px-2.5 py-1 rounded-full font-medium flex-shrink-0"
+            style={{ background: `${meta.color}20`, color: meta.color }}
+          >
+            {meta.emoji} {card.deityName}
+          </span>
+        </div>
+
+        {/* Fact text */}
+        <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.78)", letterSpacing: "0.01em" }}>
+          {card.fact}
+        </p>
+
+        {onReadStory && (
+          <button
+            onClick={onReadStory}
+            className="mt-3 text-xs font-medium flex items-center gap-1.5 transition-opacity active:opacity-70"
+            style={{ color: meta.color }}
+          >
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
+              <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
+            </svg>
+            Read full story →
+          </button>
+        )}
       </div>
-      <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.7)" }}>{card.fact}</p>
-      {onReadStory && (
-        <button
-          onClick={onReadStory}
-          className="mt-3 text-xs font-medium flex items-center gap-1.5"
-          style={{ color: meta.color }}
+    </div>
+  );
+}
+
+function AccordionCategory({
+  cat,
+  meta,
+  isOpen,
+  onToggle,
+  onBrowseAll,
+  onTopicClick,
+}: {
+  cat: string;
+  meta: { emoji: string; color: string; topics: string[] };
+  isOpen: boolean;
+  onToggle: () => void;
+  onBrowseAll: () => void;
+  onTopicClick: (topic: string) => void;
+}) {
+  return (
+    <div
+      className="rounded-2xl overflow-hidden"
+      style={{
+        background: "rgba(255,255,255,0.04)",
+        border: `1px solid ${isOpen ? meta.color + "35" : "rgba(255,255,255,0.07)"}`,
+        transition: "border-color 0.22s ease",
+      }}
+    >
+      {/* Header row — always visible, tapping toggles the accordion */}
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-3 px-4 py-3.5 text-left"
+        style={{ background: "none", border: "none", cursor: "pointer" }}
+      >
+        {/* Category icon pill */}
+        <span
+          className="flex items-center justify-center rounded-xl flex-shrink-0"
+          style={{ width: 38, height: 38, background: `${meta.color}20`, fontSize: 18 }}
         >
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
-            <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
+          {meta.emoji}
+        </span>
+
+        {/* Name + topic count */}
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium leading-tight" style={{ color: isOpen ? "#fff" : "rgba(255,255,255,0.8)" }}>
+            {cat}
+          </p>
+          <p className="text-xs mt-0.5" style={{ color: "rgba(255,255,255,0.22)" }}>
+            {meta.topics.length} topics
+          </p>
+        </div>
+
+        {/* Animated chevron */}
+        <div
+          className="flex items-center justify-center rounded-full flex-shrink-0"
+          style={{
+            width: 26,
+            height: 26,
+            background: isOpen ? `${meta.color}28` : "rgba(255,255,255,0.06)",
+            transform: `rotate(${isOpen ? 180 : 0}deg)`,
+            transition: "transform 0.25s cubic-bezier(0.4,0,0.2,1), background 0.22s ease",
+          }}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="13"
+            height="13"
+            fill="none"
+            stroke={isOpen ? meta.color : "rgba(255,255,255,0.38)"}
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{ transition: "stroke 0.22s ease" }}
+          >
+            <polyline points="6 9 12 15 18 9" />
           </svg>
-          Read full story →
-        </button>
-      )}
+        </div>
+      </button>
+
+      {/* Animated expandable panel */}
+      <div
+        style={{
+          maxHeight: isOpen ? "520px" : "0px",
+          overflow: "hidden",
+          transition: "max-height 0.32s cubic-bezier(0.4,0,0.2,1)",
+        }}
+      >
+        <div
+          className="px-4 pt-3 pb-4"
+          style={{ borderTop: "1px solid rgba(255,255,255,0.05)" }}
+        >
+          {/* Topic chips */}
+          <div className="flex flex-wrap gap-2">
+            {meta.topics.map((topic) => (
+              <button
+                key={topic}
+                onClick={() => onTopicClick(topic)}
+                className="px-3 py-1.5 rounded-full text-xs transition-all active:scale-95"
+                style={{
+                  background: `${meta.color}18`,
+                  border: `1px solid ${meta.color}35`,
+                  color: meta.color,
+                }}
+              >
+                {topic}
+              </button>
+            ))}
+          </div>
+
+          {/* Browse all CTA */}
+          <button
+            onClick={onBrowseAll}
+            className="mt-3 w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition-opacity active:opacity-75"
+            style={{ background: meta.color, color: "#fff" }}
+          >
+            Browse all {cat}
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1347,7 +1677,7 @@ function ExploreLoadingState() {
           <div className="h-3 w-4/5 rounded" style={{ background: "rgba(255,255,255,0.05)" }} />
         </div>
       ))}
-      <p className="text-xs text-center mt-2" style={{ color: "rgba(255,255,255,0.2)" }}>Gemini is thinking…</p>
+      <p className="text-xs text-center mt-2" style={{ color: "rgba(255,255,255,0.2)" }}>Loading facts…</p>
     </div>
   );
 }

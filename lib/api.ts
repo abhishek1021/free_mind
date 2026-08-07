@@ -76,6 +76,114 @@ export const CONTENT_CATEGORIES: Record<string, CategoryMeta> = {
     topics: ["Stoicism", "Existentialism", "Ethics", "Consciousness", "Free Will",
              "Meaning of Life", "Eastern Philosophy", "Ancient Wisdom", "Absurdism"],
   },
+  "Space & Astronomy": {
+    emoji: "🌌",
+    color: "#0284c7",
+    topics: ["Black Holes", "Neutron Stars", "The Big Bang", "Dark Matter", "Dark Energy",
+             "Exoplanets", "The Sun", "The Moon", "Mars", "Jupiter", "Saturn", "Venus",
+             "Milky Way", "Andromeda Galaxy", "Supernovas", "Wormholes",
+             "NASA Missions", "James Webb Telescope", "International Space Station",
+             "Comets & Asteroids", "The Oort Cloud", "Pulsars", "Quasars"],
+  },
+  "Ancient Civilizations": {
+    emoji: "🏺",
+    color: "#c2410c",
+    topics: ["Mesopotamia", "Sumerian Civilization", "Ancient Babylon",
+             "Indus Valley Civilization", "Ancient Greece", "Minoan Civilization",
+             "Carthage", "Phoenicians", "Ancient China Han Dynasty",
+             "Ancient Persia Achaemenid", "Olmec Civilization", "Ancient Maya",
+             "Aztec Empire", "Inca Empire", "Ancient Nubia"],
+  },
+  "Health & Human Body": {
+    emoji: "💊",
+    color: "#dc2626",
+    topics: ["The Human Brain", "The Heart & Circulatory System", "The Immune System",
+             "Gut Microbiome", "Human Skeleton", "Hormones & Endocrine System",
+             "The Human Eye", "Sleep Science", "Nutrition & Metabolism",
+             "Exercise & Muscles", "Cancer Biology", "Vaccines & Immunity",
+             "Antibiotics", "The Nervous System", "Blood Types",
+             "Genetics & Heredity", "Aging & Longevity"],
+  },
+  "Nature & Animals": {
+    emoji: "🌿",
+    color: "#16a34a",
+    topics: ["Deep Sea Creatures", "Amazon Rainforest", "Arctic & Antarctic",
+             "Coral Reefs", "Apex Predators", "Insects & Pollinators",
+             "Migration Patterns", "Animal Intelligence", "Plant Defense Mechanisms",
+             "Symbiosis & Mutualism", "Fungi & Mycelium", "Endangered Species",
+             "Bioluminescence", "Camouflage in Nature", "Animal Communication",
+             "Whales & Cetaceans", "Birds of Prey", "Venomous Animals"],
+  },
+  "Technology & Innovations": {
+    emoji: "⚙️",
+    color: "#0d9488",
+    topics: ["History of the Internet", "Artificial Intelligence", "Machine Learning",
+             "Blockchain", "The Printing Press", "Steam Engine",
+             "Electricity Tesla & Edison", "Telephone & Radio",
+             "Semiconductors & Transistors", "Space Technology", "Robotics",
+             "Quantum Computing", "Augmented & Virtual Reality", "Drones",
+             "3D Printing", "Renewable Energy Solar", "Nuclear Energy", "Self-Driving Cars"],
+  },
+  "Mathematics & Numbers": {
+    emoji: "∞",
+    color: "#9333ea",
+    topics: ["Pi", "Fibonacci Sequence", "Prime Numbers", "Infinity & Cantor",
+             "Golden Ratio", "Euler's Identity", "Pythagoras", "Fermat's Last Theorem",
+             "The Riemann Hypothesis", "Game Theory", "Probability & Statistics",
+             "Chaos Theory", "Fractals", "Zero History & Impact",
+             "Cryptography & Codes", "Graph Theory", "Topology"],
+  },
+  "Art & Culture": {
+    emoji: "🎨",
+    color: "#db2777",
+    topics: ["Leonardo da Vinci", "Michelangelo", "Vincent van Gogh", "Pablo Picasso",
+             "Frida Kahlo", "The Impressionist Movement", "Baroque Art",
+             "The Louvre", "The Sistine Chapel", "Ancient Cave Paintings",
+             "Classical Music Beethoven", "Classical Music Mozart", "Jazz Origins",
+             "Rock & Roll History", "Hip-Hop Origins", "Ballet",
+             "Traditional Indian Dance", "Japanese Kabuki"],
+  },
+  "Famous Scientists & Inventors": {
+    emoji: "🔭",
+    color: "#0369a1",
+    topics: ["Isaac Newton", "Albert Einstein", "Marie Curie", "Nikola Tesla",
+             "Charles Darwin", "Galileo Galilei", "Stephen Hawking", "Alan Turing",
+             "Ada Lovelace", "Rosalind Franklin", "Archimedes", "Thomas Edison",
+             "Alexander Fleming", "Carl Sagan", "Richard Feynman",
+             "Gregor Mendel", "Srinivasa Ramanujan", "C.V. Raman"],
+  },
+  "Economics & Business": {
+    emoji: "📈",
+    color: "#ca8a04",
+    topics: ["The Great Depression", "The 2008 Financial Crisis",
+             "How the Stock Market Works", "Capitalism vs Socialism",
+             "Adam Smith & The Wealth of Nations", "John Maynard Keynes",
+             "Warren Buffett", "Steve Jobs & Apple", "The Rise of Amazon",
+             "Bitcoin & Cryptocurrency", "Inflation & Deflation",
+             "Monopolies in History", "The Tulip Mania", "Behavioral Economics"],
+  },
+  "Food & Cuisine": {
+    emoji: "🍜",
+    color: "#ea580c",
+    topics: ["Origins of Bread", "History of Spices & The Spice Trade",
+             "Fermentation Science", "How Chocolate Was Discovered",
+             "History of Coffee", "Tea & Its Origins",
+             "Street Food Around the World", "Why Food Goes Bad",
+             "The Science of Taste", "The Maillard Reaction",
+             "Umami The Fifth Taste", "History of Salt", "How Wine Is Made",
+             "Food Preservation Methods", "History of Sugar"],
+  },
+  "Language & Words": {
+    emoji: "🗣️",
+    color: "#7c3aed",
+    topics: ["Origin of English", "How Languages Evolve & Die", "Sign Languages",
+             "Oldest Written Languages", "Sanskrit & Its Influence",
+             "Latin & Its Legacy", "The Rosetta Stone",
+             "Words with No English Translation", "False Cognates",
+             "The Sapir-Whorf Hypothesis", "Pidgin & Creole Languages",
+             "Constructed Languages Esperanto", "How Children Acquire Language",
+             "Animal Communication vs Language", "The Most Complex Writing Systems"],
+  },
   "Short Stories": {
     emoji: "📖",
     color: "#c2410c",
@@ -174,6 +282,51 @@ export async function fetchMixedBatch(count = 5): Promise<MythCard[]> {
   return results
     .filter((r) => r.status === "fulfilled")
     .flatMap((r) => (r as PromiseFulfilledResult<MythCard[]>).value);
+}
+
+// ── DynamoDB-backed fact fetching ─────────────────────────────
+// Used by feed and explore for all non-story, non-riddle categories.
+// Falls back to Gemini when DB returns no results (e.g. category not yet seeded).
+
+// Categories served from DynamoDB
+export const DB_CATEGORIES = new Set([
+  "Mythology", "Science", "History",
+  "Life Hacks", "Psychology", "World Facts", "Philosophy",
+  "Space & Astronomy", "Ancient Civilizations", "Health & Human Body",
+  "Nature & Animals", "Technology & Innovations", "Mathematics & Numbers",
+  "Art & Culture", "Famous Scientists & Inventors", "Economics & Business",
+  "Food & Cuisine", "Language & Words",
+]);
+
+// Categories that always use Gemini (stories or not seeded)
+export const GEMINI_ONLY_CATEGORIES = new Set(["Short Stories", "Moral Stories", "Riddles"]);
+
+export function isDbCategory(category: string): boolean {
+  return DB_CATEGORIES.has(category);
+}
+
+async function _fetchDb(params: Record<string, string | number>): Promise<MythCard[]> {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) qs.set(k, String(v));
+  const res = await fetch(`/api/facts/db?${qs}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data.facts) ? data.facts : [];
+}
+
+// Mixed feed from all DB categories for a given shard (0-9)
+export async function fetchDbMixed(shard: number): Promise<MythCard[]> {
+  return _fetchDb({ shard });
+}
+
+// Single category feed for a given shard
+export async function fetchDbCategory(category: string, shard: number): Promise<MythCard[]> {
+  return _fetchDb({ category, shard });
+}
+
+// Topic-specific for explore tab; returns [] if topic not in DB → caller uses Gemini
+export async function fetchDbTopic(category: string, topic: string): Promise<MythCard[]> {
+  return _fetchDb({ category, topic });
 }
 
 // ── Client-side image cache (browser session) ─────────────────
