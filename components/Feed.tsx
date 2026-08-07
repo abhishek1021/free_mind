@@ -216,23 +216,15 @@ export default function Feed() {
 
   // Splice a Telegram post into the feed at the correct interleaved position.
   // Pattern: 1 fact then 1 post → positions 1, 3, 5, 7, 9, …
-  // If the user has already scrolled past the target slot, pick a random position
-  // in the tail of the feed. Hard cap: 25 Telegram posts per session.
+  // Always inserts at targetIdx (clamped to end if feed is shorter).
+  // Hard cap: 25 Telegram posts per session.
   function injectTelegramPost(item: FeedItem) {
     if (tgInsertCountRef.current >= 25) return;
     const n = tgInsertCountRef.current++;           // 0-indexed ordinal before insert
     const targetIdx = 1 + n * 2;                   // ideal slot: after every 1 fact
     setFeedItems((prev) => {
       if (prev.length === 0) return prev;
-      let insertIdx: number;
-      if (prev.length <= targetIdx) {
-        // Feed is still shorter than the target slot — append at end
-        insertIdx = prev.length;
-      } else {
-        // User has scrolled past the ideal slot — pick a random position in the tail
-        const tail = prev.length - targetIdx;
-        insertIdx = targetIdx + Math.floor(Math.random() * tail);
-      }
+      const insertIdx = Math.min(targetIdx, prev.length);
       const next = [...prev];
       next.splice(insertIdx, 0, item);
       return next;
