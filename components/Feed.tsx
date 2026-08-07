@@ -743,9 +743,11 @@ export default function Feed() {
                     ) : (
                       <>
                         {exploreCards.map((card) => (
-                          <ExploreFactCard
+                          <InstaFactCard
                             key={card.id}
                             card={card}
+                            isBookmarked={bookmarks.some((b) => b.id === card.id)}
+                            onBookmark={() => toggleBookmark(card)}
                             onReadStory={STORY_CATEGORIES.has(card.category) ? () => setStoryCard(card) : undefined}
                           />
                         ))}
@@ -1187,7 +1189,10 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
   }
 
   function handleVideoTap() {
-    if (videoSrc) revealControls();
+    if (!videoSrc) return;
+    const v = videoRef.current;
+    if (v) { if (v.paused) v.play().catch(() => {}); else v.pause(); }
+    revealControls();
   }
 
   function handlePlayPause(e: React.MouseEvent) {
@@ -1219,6 +1224,51 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
 
   // Controls are visible when paused (always) or recently tapped (while playing)
   const showControls = !!videoSrc && (!isPlaying || ctrlVisible);
+
+  function CenterPlayPause() {
+    return (
+      <button
+        onClick={(e) => { e.stopPropagation(); handlePlayPause(e); }}
+        onPointerDown={(e) => e.stopPropagation()}
+        aria-label={isPlaying ? "Pause" : "Play"}
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "transparent",
+          border: "none",
+          cursor: "pointer",
+          opacity: showControls ? 1 : 0,
+          transition: "opacity 0.25s ease",
+          pointerEvents: showControls ? "auto" : "none",
+        }}
+      >
+        <div style={{
+          width: 52,
+          height: 52,
+          borderRadius: "50%",
+          background: "rgba(0,0,0,0.55)",
+          backdropFilter: "blur(8px)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          boxShadow: "0 2px 12px rgba(0,0,0,0.4)",
+        }}>
+          {isPlaying ? (
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+              <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+            </svg>
+          ) : (
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+          )}
+        </div>
+      </button>
+    );
+  }
 
   // IntersectionObserver: autoplay CDN videos on enter; pause all on exit
   useEffect(() => {
@@ -1354,10 +1404,34 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
         />
       )}
       <div
-        className="rounded-2xl overflow-hidden select-none"
-        style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(36,129,204,0.2)" }}
+        className="relative rounded-2xl overflow-hidden select-none"
+        style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(36,129,204,0.35)" }}
         {...longPress}
       >
+        {/* Telegram source badge */}
+        <div
+          style={{
+            position: "absolute",
+            top: 10,
+            right: 10,
+            zIndex: 10,
+            display: "flex",
+            alignItems: "center",
+            gap: 5,
+            background: "#2481cc",
+            borderRadius: 20,
+            padding: "3px 9px 3px 6px",
+            boxShadow: "0 2px 8px rgba(36,129,204,0.45)",
+          }}
+        >
+          {/* Telegram paper-plane icon */}
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="white">
+            <path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/>
+          </svg>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "#fff", letterSpacing: "0.02em", lineHeight: 1 }}>
+            Telegram
+          </span>
+        </div>
         {post.hasVideo && post.mediaUrl && (
           <div
             ref={containerRef}
@@ -1428,7 +1502,9 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
               </>
             )}
 
-            {/* Unified player controls overlay */}
+            {/* Center play/pause button */}
+            {videoSrc && <CenterPlayPause />}
+            {/* Bottom scrubber + controls overlay */}
             {videoSrc && <VideoControls />}
           </div>
         )}
@@ -1484,48 +1560,6 @@ function TelegramPostCard({ post, channel }: { post: TelegramPost; channel: Tele
   );
 }
 
-function ExploreFactCard({ card, onReadStory }: { card: MythCard; onReadStory?: () => void }) {
-  const meta = CONTENT_CATEGORIES[card.category] ?? CONTENT_CATEGORIES["Mythology"];
-  return (
-    <div
-      className="w-full text-left rounded-2xl overflow-hidden"
-      style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" }}
-    >
-      {/* Colored top accent bar */}
-      <div style={{ height: 3, background: `linear-gradient(90deg, ${meta.color}, ${meta.color}55)` }} />
-
-      <div className="p-4">
-        {/* Topic badge */}
-        <div className="flex items-center gap-2 mb-2.5">
-          <span
-            className="text-xs px-2.5 py-1 rounded-full font-medium flex-shrink-0"
-            style={{ background: `${meta.color}20`, color: meta.color }}
-          >
-            {meta.emoji} {card.deityName}
-          </span>
-        </div>
-
-        {/* Fact text */}
-        <p className="text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.78)", letterSpacing: "0.01em" }}>
-          {card.fact}
-        </p>
-
-        {onReadStory && (
-          <button
-            onClick={onReadStory}
-            className="mt-3 text-xs font-medium flex items-center gap-1.5 transition-opacity active:opacity-70"
-            style={{ color: meta.color }}
-          >
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
-              <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
-            </svg>
-            Read full story →
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
 
 function AccordionCategory({
   cat,
